@@ -9,8 +9,11 @@ import { curate, tasteProfile, aiEnabled, kidsContexts } from './curator.js';
 import * as passkeys from './passkeys.js';
 import { writeOrder, DealError, stalenessForUser } from './deal.js';
 import { setSchedule, startAutoDeal, runDue } from './autodeal.js';
-import { rediscover, blend, wrapped, wrappedPeriods } from './insights.js';
-import { startSleep, sleepStatus, cancelSleep } from './sleep.js';
+import { rediscover } from './insights.js';
+import { ServiceError, grownRows, saveDealt, restoreBackup, blendFor, saveBlend, wrappedFor, kidsPlay, nowPlaying, sameTracks } from './services.js';
+import { createToken, listTokens, revokeToken, findToken, tooManyFailures, noteFailure } from './tokens.js';
+import { actions, runAction, inputSchema } from './actions.js';
+import { handleMcp } from './mcp.js';
 import { startTracking, pollUser, playsFor, addPlays, fromExport, summarise, overlap, POLL_MINUTES, freshStart } from './plays.js';
 
 for (const key of ['SPOTIFY_CLIENT_ID', 'SPOTIFY_CLIENT_SECRET', 'APP_URL']) {
@@ -118,10 +121,12 @@ function startSession(res, userId) {
 const passkeyRoute = (fn) => async (req, res, next) => {
   if (!passkeys.passkeysAvailable) return res.status(400).json({ error: passkeys.passkeysWhyNot });
   if (req.get('x-dj') !== '1') return res.status(403).json({ error: 'Bad request' });
+  if (tooManyFailures(req.ip)) return res.status(429).json({ error: 'Too many failed attempts. Wait a few minutes and try again.' });
   try {
     await fn(req, res);
   } catch (err) {
     if (err instanceof passkeys.PasskeyError || err?.name === 'Error') {
+      noteFailure(req.ip);
       console.error('passkey:', err.message);
       return res.status(400).json({ error: err instanceof passkeys.PasskeyError ? err.message : 'The passkey couldn’t be verified. Try again.' });
     }
@@ -245,8 +250,6 @@ app.post(
   }),
 );
 
-const sameTracks = (a, b) => a.length === b.length && [...a].sort().join('\n') === [...b].sort().join('\n');
-
 app.post(
   '/api/playlists/:id/apply',
   auth,
@@ -288,15 +291,9 @@ app.post(
   '/api/playlists/:id/restore',
   auth,
   wrap(async (req, res) => {
-    const backup = store.getBackup(req.user.id, req.params.id);
-    if (!backup) return res.status(404).json({ error: 'Nothing to restore' });
-    const current = await loadTracks(req, req.params.id, { fresh: true });
-    if (!sameTracks(current.map((t) => t.uri), backup.uris)) {
-      return res.status(409).json({ error: 'Tracks were added or removed since the shuffle, so the old order no longer fits.' });
-    }
-    await req.sp.replacePlaylistItems(req.params.id, backup.uris);
+    const r = await restoreBackup(req.user, req.sp, req.params.id);
     trackCache.delete(`${req.user.id}:${req.params.id}`);
-    res.json({ ok: true });
+    res.json(r);
   }),
 );
 
@@ -352,35 +349,6 @@ app.post('/api/brief', auth, async (req, res) => {
 
 // ------------------------------------------- rediscover, blend, wrapped ----
 
-/** A person's own plays, with Kids mode plays left out. */
-function grownRows(userId) {
-  const kidsCtx = kidsContexts(userId);
-  return playsFor(userId).filter((r) => !(r.ctx && kidsCtx.has(r.ctx)));
-}
-
-const asTrack = (t) => ({ uri: t.uri, name: t.name, artists: t.artists ?? [{ id: null, name: t.artist }], album: { id: null, name: t.album ?? '' } });
-
-/** Create (or refresh, if we made it before) a playlist with a dealt order. */
-async function saveDealt(req, { key, name, description, tracks }) {
-  const order = properShuffle(tracks.map(asTrack)).map((t) => t.uri);
-  const made = store.getMade(req.user.id, key);
-  let id = made;
-  if (id) {
-    try {
-      await req.sp.updatePlaylistDetails(id, { name, description });
-    } catch (err) {
-      if (err.status === 404 || err.status === 403) id = null;
-      else throw err;
-    }
-  }
-  if (!id) {
-    id = (await req.sp.createPlaylist({ name, description })).id;
-    store.setMade(req.user.id, key, id);
-  }
-  await req.sp.replacePlaylistItems(id, order);
-  return { url: `https://open.spotify.com/playlist/${id}`, updated: !!made && made === id };
-}
-
 app.get('/api/rediscover', auth, (req, res) => {
   const rows = grownRows(req.user.id);
   res.json({ since: rows[0]?.at ?? null, sets: rediscover(rows).map((s) => ({ ...s, made: !!store.getMade(req.user.id, `rediscover:${s.id}`) })) });
@@ -392,52 +360,20 @@ app.post(
   wrap(async (req, res) => {
     const set = rediscover(grownRows(req.user.id)).find((s) => s.id === req.params.set);
     if (!set || set.tracks.length < 2) return res.status(404).json({ error: 'Not enough songs for that one yet.' });
-    res.json(await saveDealt(req, { key: `rediscover:${set.id}`, name: set.title, description: `${set.blurb} Made by dj from your play history.`, tracks: set.tracks }));
+    res.json(await saveDealt(req.user, req.sp, { key: `rediscover:${set.id}`, name: set.title, description: `${set.blurb} Made by dj from your play history.`, tracks: set.tracks }));
   }),
 );
-
-function blendFor(req) {
-  const partner = store.allUsers().find((u) => u.id !== req.user.id);
-  if (!partner) return null;
-  const size = Math.min(100, Math.max(20, Number(req.query.size || req.body?.size) || 50));
-  return { partner, ...blend(grownRows(req.user.id), grownRows(partner.id), { size }) };
-}
 
 app.get('/api/blend', auth, (req, res) => {
-  const b = blendFor(req);
+  const b = blendFor(req.user, req.query.size);
   if (!b) return res.json({ partner: null });
-  const key = `blend:${[req.user.id, b.partner.id].sort().join('+')}`;
-  res.json({ partner: { id: b.partner.id, name: b.partner.name, image: b.partner.image }, tracks: b.tracks, counts: b.counts, shared: b.shared, made: !!store.getMade(req.user.id, key) });
+  res.json({ partner: { id: b.partner.id, name: b.partner.name, image: b.partner.image }, tracks: b.tracks, counts: b.counts, shared: b.shared, made: !!store.getMade(req.user.id, b.key) });
 });
 
-app.post(
-  '/api/blend/save',
-  auth,
-  wrap(async (req, res) => {
-    const b = blendFor(req);
-    if (!b || b.tracks.length < 2) return res.status(400).json({ error: 'Both of you need some play history first.' });
-    const names = [req.user.name, b.partner.name].map((n) => n.split(' ')[0]);
-    const key = `blend:${[req.user.id, b.partner.id].sort().join('+')}`;
-    res.json(await saveDealt(req, { key, name: `${names[0]} + ${names[1]}`, description: `Both of you, evenly: songs you both play, then each person’s favourites. Made by dj from your play histories.`, tracks: b.tracks }));
-  }),
-);
+app.post('/api/blend/save', auth, wrap(async (req, res) => res.json(await saveBlend(req.user, req.sp, req.body?.size))));
 
 app.get('/api/wrapped', auth, (req, res) => {
-  const tz = isValidTz(req.query.tz) ? req.query.tz : 'UTC';
-  const rows = grownRows(req.user.id);
-  const periods = wrappedPeriods(rows, tz);
-  const period = /^\d{4}(-\d{2})?$/.test(req.query.period ?? '') ? req.query.period : periods.months[1] ?? periods.months[0] ?? periods.years[0];
-  if (!period) return res.json({ periods, wrapped: null });
-  const w = wrapped(rows, period, tz);
-  // Compare with the period before.
-  let prev = null;
-  if (period.length === 4) prev = String(Number(period) - 1);
-  else {
-    const [y, m] = period.split('-').map(Number);
-    prev = m === 1 ? `${y - 1}-12` : `${y}-${String(m - 1).padStart(2, '0')}`;
-  }
-  const pw = wrapped(rows, prev, tz);
-  res.json({ periods, wrapped: w && { ...w, prevPlays: pw?.plays ?? null, prevLabel: pw?.label ?? null } });
+  res.json(wrappedFor(req.user, req.query.period, isValidTz(req.query.tz) ? req.query.tz : 'UTC'));
 });
 
 // -------------------------------------------------------------- history ----
@@ -615,48 +551,9 @@ app.post('/api/kids/brief', auth, async (req, res) => {
 
 // Start a kids playlist on whatever device is around (the phone in the car,
 // the speaker at home), freshly dealt so it's never the same order twice.
-app.post(
-  '/api/kids/play/:id',
-  auth,
-  wrap(async (req, res) => {
-    const entry = store.kidsPlaylists(req.user.id).find((p) => p.id === req.params.id);
-    if (!entry) return res.status(404).json({ error: 'Not a Kids mode playlist' });
-    const openUrl = `https://open.spotify.com/playlist/${entry.id}`;
+app.post('/api/kids/play/:id', auth, wrap(async (req, res) => res.json(await kidsPlay(req.user, req.sp, req.params.id))));
 
-    if (entry.redeal) {
-      const tracks = await req.sp.playlistTracks(entry.id);
-      if (tracks.length > 1 && !tracks.some((t) => t.local)) {
-        await req.sp.replacePlaylistItems(entry.id, properShuffle(tracks).map((t) => t.uri));
-      }
-    }
-
-    const devices = await req.sp.devices();
-    const device = devices.find((d) => d.is_active) ?? devices.find((d) => !d.is_restricted);
-    if (!device) {
-      return res.status(409).json({ error: 'No Spotify device is awake. Open Spotify on the phone or speaker, then tap again.', openUrl });
-    }
-    await req.sp.setShuffle(false, device.id).catch(() => {});
-    await req.sp.play(`spotify:playlist:${entry.id}`, device.id);
-    const sleep = entry.sleep ? startSleep(req.user.id, req.sp, { contextUri: `spotify:playlist:${entry.id}`, minutes: entry.sleep, deviceId: device.id }) : (cancelSleep(req.user.id), null);
-    res.json({ ok: true, device: device.name, sleep });
-  }),
-);
-
-app.get(
-  '/api/player',
-  auth,
-  wrap(async (req, res) => {
-    const st = await req.sp.playerState();
-    const t = st?.item;
-    res.json({
-      playing: !!st?.is_playing,
-      device: st?.device?.name ?? null,
-      context: st?.context?.uri ?? null,
-      track: t ? { name: t.name, artists: (t.artists ?? []).map((a) => a.name).join(', '), image: t.album?.images?.[0]?.url ?? null } : null,
-      sleep: sleepStatus(req.user.id),
-    });
-  }),
-);
+app.get('/api/player', auth, wrap(async (req, res) => res.json(await nowPlaying(req.user, req.sp))));
 
 app.post(
   '/api/player/:action',
@@ -668,6 +565,83 @@ app.post(
     res.json({ ok: true });
   }),
 );
+
+
+// ------------------------------------------------------- agents & tokens ----
+// The same actions over MCP (/mcp), plain HTTP (/api/v1) and the `dj` CLI,
+// authenticated with personal access tokens.
+
+app.get('/api/tokens', auth, (req, res) => res.json({ tokens: listTokens(req.user), mcpUrl: `${APP_URL}/mcp`, apiUrl: `${APP_URL}/api/v1`, appUrl: APP_URL }));
+app.post('/api/tokens', auth, (req, res) => res.json(createToken(req.user, { name: req.body?.name, readOnly: !!req.body?.readOnly })));
+app.delete('/api/tokens/:id', auth, (req, res) => res.json({ tokens: revokeToken(req.user, req.params.id) }));
+
+function bearer(req, res, next) {
+  const m = /^Bearer\s+(\S+)$/i.exec(req.get('authorization') || '');
+  const found = m && findToken(m[1]);
+  // A valid token always works; repeated bad ones from one address get slowed down.
+  if (!found) {
+    if (tooManyFailures(req.ip)) return res.status(429).json({ error: 'Too many failed attempts. Wait a few minutes.' });
+    noteFailure(req.ip);
+    res.set('WWW-Authenticate', 'Bearer realm="dj"');
+    return res.status(401).json({ error: 'Missing or invalid token. Create one in dj: avatar menu → Agents & API.' });
+  }
+  req.user = found.user;
+  req.sp = spotifyFor(found.user.id);
+  req.readOnly = found.entry.readOnly;
+  next();
+}
+
+const actionCtx = (req) => ({ user: req.user, sp: req.sp, readOnly: req.readOnly });
+
+app.post('/mcp', bearer, wrap(async (req, res) => handleMcp(req, res, actionCtx(req))));
+app.all('/mcp', (req, res) => res.status(405).set('Allow', 'POST').json({ error: 'This MCP server is stateless: POST only.' }));
+
+app.get('/api/v1/actions', bearer, (req, res) => {
+  res.json({
+    user: { id: req.user.id, name: req.user.name },
+    read_only: req.readOnly,
+    // Named so a client can explain why they're missing.
+    hidden_by_read_only: req.readOnly ? actions.filter((a) => !a.readOnly).map((a) => a.name) : [],
+    actions: actions.filter((a) => a.readOnly || !req.readOnly).map((a) => ({ name: a.name, title: a.title, description: a.description, read_only: a.readOnly, input: inputSchema(a) })),
+  });
+});
+
+app.post(
+  '/api/v1/actions/:name',
+  bearer,
+  wrap(async (req, res) => {
+    const result = await runAction(actionCtx(req), req.params.name, req.body ?? {});
+    res.json({ ok: true, result });
+  }),
+);
+
+// OpenAPI description of the HTTP API, for tools that import one.
+app.get('/api/v1/openapi.json', (req, res) => {
+  const paths = {};
+  for (const a of actions) {
+    paths[`/actions/${a.name}`] = {
+      post: {
+        operationId: a.name,
+        summary: a.title,
+        description: a.description + (a.readOnly ? '' : ' (Needs a token that is not read-only.)'),
+        requestBody: { required: true, content: { 'application/json': { schema: inputSchema(a) } } },
+        responses: { 200: { description: 'OK', content: { 'application/json': { schema: { type: 'object', properties: { ok: { type: 'boolean' }, result: { type: 'object' } } } } } }, 400: { description: 'Bad arguments' }, 401: { description: 'Bad token' }, 403: { description: 'Not allowed' } },
+      },
+    };
+  }
+  res.json({
+    openapi: '3.1.0',
+    info: { title: 'dj', version: '1', description: 'Proper Spotify shuffles, play history and playlists. Authenticate with a dj personal access token.' },
+    servers: [{ url: `${APP_URL}/api/v1` }],
+    components: { securitySchemes: { token: { type: 'http', scheme: 'bearer' } } },
+    security: [{ token: [] }],
+    paths,
+  });
+});
+
+// The CLI and the agent skill, downloadable straight from your dj.
+app.get('/cli/dj', (req, res) => res.type('text/javascript').sendFile(path.join(here, '..', 'cli', 'dj.mjs')));
+app.get('/skill/SKILL.md', (req, res) => res.type('text/markdown').sendFile(path.join(here, '..', 'skills', 'dj', 'SKILL.md')));
 
 // --------------------------------------------------------------- static ----
 
@@ -691,6 +665,7 @@ function friendly(err) {
 }
 
 app.use((err, req, res, _next) => {
+  if (err instanceof ServiceError) return res.status(err.status).json({ error: err.message, ...err.extra });
   console.error(err);
   res.status(err instanceof SpotifyError && err.status < 500 ? err.status : 500).json({ error: friendly(err) });
 });

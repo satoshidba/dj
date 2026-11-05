@@ -5,6 +5,7 @@ Proper shuffles and AI-briefed playlists for Spotify. Self-hosted, built for a c
 - **Deal**: pick a playlist and dj rewrites its order so the same artist never plays twice in a row and big artists are spread as far apart as the length allows. Then play it *in order*, with shuffle off. Want a new order? Deal again.
 - **Fresh deals & auto-deal**: deals push songs you've hammered lately towards the end, and any playlist can re-deal itself every morning or every Monday.
 - **Rediscover, Together, Wrapped**: playlists from your own past, one balanced playlist for the two of you, and a Wrapped for any month or year.
+- **Agents**: Hermes, Pi, Claude or any other agent can use dj through an MCP server, a `dj` command-line tool with an Agent Skill, or a plain HTTP API.
 - **Plays**: dj logs every play for both of you, every 10 minutes, so you get a complete history rather than Spotify's last 50. Older years can be imported from Spotify's data export.
 - **Kids**: a locked-down screen of big picture buttons for the car or the living room, with AI-made clean playlists and the kids' plays kept out of your own stats.
 - **Brief**: describe the moment ("running at 5:00/km, good rock", "deep focus, classical") and a curator (Claude) reads your Spotify listening history and builds a playlist for it.
@@ -75,6 +76,52 @@ On **Brief** (and Kids → *Make a new one*), switch Length from *Songs* to *Tim
 ## Bedtime fade (Kids mode)
 
 On a Kids button (Kids tab), set the 🌙 sleep timer to 20, 30, 45 or 60 minutes. When that button is tapped, the music plays as normal, then the volume eases down over the last 10 minutes and pauses, and the volume goes back to where it was for next time. The kids screen shows the time left. It runs on the server, so it keeps working with the phone screen locked. A few devices don't let apps change volume; on those it just pauses at the end. Restarting the container cancels a running timer.
+
+
+## Agents: Hermes, Pi, Claude and others
+
+Everything dj does is available to AI agents and scripts, as the person who created the token. In dj, open the avatar menu → **Agents & API** and create a **token**. It's shown once, and you can tick **Read-only** for one that can look but not change anything. The same screen gives copy-paste setup with the token filled in.
+
+There are three ways in, all with the same 19 actions (list, look at and deal playlists, auto-deal, stats, recent plays, Wrapped, Rediscover, Together, create playlists from songs or from a brief, search, Kids buttons and playback):
+
+| Way in | For | Address |
+|---|---|---|
+| **MCP** (Streamable HTTP, stateless) | Hermes, Claude Code / Desktop, Cursor, any MCP client | `<APP_URL>/mcp` with `Authorization: Bearer <token>` |
+| **`dj` command + Agent Skill** | Pi, and any agent that can run shell commands | `<APP_URL>/cli/dj` and `<APP_URL>/skill/SKILL.md` |
+| **HTTP API** | scripts, Home Assistant, anything else | `POST <APP_URL>/api/v1/actions/<name>`, described at `<APP_URL>/api/v1/openapi.json` |
+
+**Hermes**: add to `~/.hermes/config.yaml`, then `/reload-mcp`:
+```yaml
+mcp_servers:
+  dj:
+    url: "https://<your-dj>/mcp"
+    headers:
+      Authorization: "Bearer <token>"
+```
+
+**Pi** (no built-in MCP; it uses commands and skills). This needs Node 18+:
+```bash
+mkdir -p ~/.local/bin && curl -fsSL https://<your-dj>/cli/dj -o ~/.local/bin/dj && chmod +x ~/.local/bin/dj
+```
+```bash
+dj login https://<your-dj> <token>
+```
+```bash
+mkdir -p ~/.pi/agent/skills/dj && curl -fsSL https://<your-dj>/skill/SKILL.md -o ~/.pi/agent/skills/dj/SKILL.md
+```
+Other agents that read Agent Skills look in `~/.agents/skills/` instead.
+
+**Claude Code**:
+```bash
+claude mcp add --transport http dj https://<your-dj>/mcp --header "Authorization: Bearer <token>"
+```
+
+**Using the CLI yourself:** run `dj actions`, `dj help deal_playlist`, `dj deal_playlist "Gym Rock"` or `dj listening_stats --range 7d`. Output is JSON.
+
+**Things to know**
+- Agents must be able to reach dj. Anything on your tailnet can. Claude on the web and phone apps connect from Anthropic's servers, so they'd need dj made public (e.g. Tailscale Funnel). That's your call; it's off by default.
+- `create_playlist` lets the agent choose the songs with its own model (no dj AI needed). `brief_playlist` uses dj's curator and your Anthropic key.
+- Tokens are stored as hashes, can be revoked any time, and show when they were last used. Repeated bad tokens from one address are slowed down; valid tokens are never blocked.
 
 ## What Spotify allows (2026 rules)
 
@@ -172,6 +219,12 @@ server/
   insights.js  Rediscover, Together blend, Wrapped
   sleep.js     Kids bedtime fade
   passkeys.js  WebAuthn sign-in
+  services.js  logic shared by the web routes and agent actions
+  actions.js   the 19 agent actions (one registry for MCP, HTTP and CLI)
+  mcp.js       MCP server at /mcp
+  tokens.js    personal access tokens, failed-auth rate limiting
+cli/dj.mjs     the dj command (no dependencies)
+skills/dj/     Agent Skill (SKILL.md) for Pi and others
   store.js     JSON file store in DATA_DIR
 public/        no-build frontend: index.html, styles.css, app.js
 ```

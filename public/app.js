@@ -334,6 +334,7 @@ function appShell() {
           { class: 'menu', role: 'menu' },
           h('div', { class: 'hint' }, state.session.passkeys?.available ? `Signed in as ${u.name}. To switch, sign out and use the other person’s passkey.` : `Signed in as ${u.name}. To switch to the other account, log out and Spotify will ask who you are.`),
           state.session.passkeys?.available ? h('button', { role: 'menuitem', onClick: () => { toggle(); openPasskeys(); } }, 'Passkeys') : null,
+          h('button', { role: 'menuitem', onClick: () => { toggle(); openAgents(); } }, 'Agents & API'),
           h('button', { role: 'menuitem', onClick: () => logout(!state.session.passkeys?.available) }, 'Switch account'),
           h('button', { role: 'menuitem', onClick: () => logout(false) }, 'Log out'),
         ),
@@ -2039,6 +2040,151 @@ async function openPasskeys() {
   }
   try {
     fill((await api('/api/passkeys')).passkeys);
+  } catch (err) {
+    toast(err.message, { error: true });
+  }
+}
+
+
+// ---------------------------------------------------------- agents & api --
+// Personal access tokens, plus copy-paste setup for MCP clients (Hermes,
+// Claude, …), the `dj` CLI + skill (Pi and any shell-capable agent) and HTTP.
+
+function copyBtn(getText, label = 'Copy') {
+  const b = h('button', { class: 'btn ghost small copy', type: 'button' }, label);
+  b.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(getText());
+      b.textContent = 'Copied';
+    } catch {
+      b.textContent = 'Select and copy';
+    }
+    setTimeout(() => (b.textContent = label), 1600);
+  });
+  return b;
+}
+
+function snippet(title, text, note) {
+  return h('div', { class: 'snip' }, h('div', { class: 'snip-head' }, h('b', {}, title), copyBtn(() => text)), note ? h('p', { class: 'muted small' }, note) : null, h('pre', {}, h('code', {}, text)));
+}
+
+function setupGuides(info, token) {
+  const T = token || '<your token>';
+  const mcp = info.mcpUrl;
+  const app = info.appUrl;
+  const guides = {
+    hermes: [
+      snippet('Add to ~/.hermes/config.yaml', `mcp_servers:\n  dj:\n    url: "${mcp}"\n    headers:\n      Authorization: "Bearer ${T}"`, 'Then run /reload-mcp in Hermes.'),
+    ],
+    pi: [
+      snippet('1. Install the dj command (needs Node 18+)', `mkdir -p ~/.local/bin && curl -fsSL ${app}/cli/dj -o ~/.local/bin/dj && chmod +x ~/.local/bin/dj`),
+      snippet('2. Connect it', `dj login ${app} ${T}`),
+      snippet('3. Teach Pi to use it', `mkdir -p ~/.pi/agent/skills/dj && curl -fsSL ${app}/skill/SKILL.md -o ~/.pi/agent/skills/dj/SKILL.md`, 'Other agents that read Agent Skills: use ~/.agents/skills/dj instead.'),
+    ],
+    claude: [
+      snippet('Claude Code', `claude mcp add --transport http dj ${mcp} --header "Authorization: Bearer ${T}"`),
+      h('p', { class: 'muted small' }, 'Claude Desktop and other MCP apps: add a remote MCP server with the URL and header below. Claude on the web and phone connect from Anthropic’s servers, so they can only reach dj if it’s public (e.g. Tailscale Funnel).'),
+    ],
+    other: [
+      snippet('MCP server', `URL:    ${mcp}\nHeader: Authorization: Bearer ${T}`, 'Streamable HTTP, stateless. Works with any MCP client that can send a header.'),
+      snippet('HTTP API', `curl -s -X POST ${info.apiUrl}/actions/listening_stats \\\n  -H "Authorization: Bearer ${T}" -H "Content-Type: application/json" \\\n  -d '{"range":"7d"}'`, `Every action is POST ${info.apiUrl}/actions/<name>. OpenAPI: ${info.apiUrl}/openapi.json`),
+    ],
+  };
+  let current = 'hermes';
+  const body = h('div', { class: 'guide-body' });
+  const tabs = h('div', { class: 'seg', role: 'tablist' });
+  const show = (k) => {
+    current = k;
+    body.replaceChildren(...guides[k]);
+    for (const b of tabs.children) b.setAttribute('aria-checked', String(b.dataset.k === current));
+  };
+  for (const [k, l] of [['hermes', 'Hermes'], ['pi', 'Pi & CLI'], ['claude', 'Claude'], ['other', 'Other']]) {
+    const b = h('button', { role: 'tab', 'data-k': k, onClick: () => show(k) }, l);
+    tabs.append(b);
+  }
+  show(current);
+  return h('div', { class: 'guides' }, tabs, body);
+}
+
+async function openAgents() {
+  const list = h('div', { class: 'pk-list' }, h('div', { class: 'skeleton', style: { height: '56px' } }));
+  const reveal = h('div', {});
+  const guideHost = h('div', {});
+  let info = null;
+  const name = h('input', { class: 'kfield-input', placeholder: 'e.g. Hermes on laptop', 'aria-label': 'Token name', maxlength: 60 });
+  const ro = h('input', { type: 'checkbox' });
+
+  const dlg = h(
+    'dialog',
+    { class: 'sheet wide', 'aria-label': 'Agents & API' },
+    h('div', { class: 'sheet-head' }, h('h2', { class: 'serif' }, 'Agents & API'), h('button', { class: 'x', 'aria-label': 'Close', onClick: () => dlg.close() }, '×')),
+    h('p', { class: 'muted' }, 'Let an AI agent or script use dj as you: Hermes, Pi, Claude, or anything that speaks MCP, runs commands or calls HTTP. Each token acts as you only, and can be read-only.'),
+    h(
+      'div',
+      { class: 'tok-new' },
+      name,
+      h('label', { class: 'check' }, ro, 'Read-only'),
+      h('button', {
+        class: 'btn accent small',
+        onClick: async () => {
+          try {
+            const r = await api('/api/tokens', { method: 'POST', body: { name: name.value.trim() || 'Agent', readOnly: ro.checked } });
+            name.value = '';
+            reveal.replaceChildren(
+              h(
+                'div',
+                { class: 'tok-reveal' },
+                h('b', {}, `Your token for “${r.entry.name}”`),
+                h('p', { class: 'small' }, 'Copy it now: dj only keeps a fingerprint and can’t show it again. The setup below already has it filled in.'),
+                h('div', { class: 'tok-row' }, h('code', {}, r.token), copyBtn(() => r.token)),
+              ),
+            );
+            guideHost.replaceChildren(setupGuides(info, r.token));
+            await refresh();
+          } catch (err) {
+            toast(err.message, { error: true });
+          }
+        },
+      }, 'Create token'),
+    ),
+    reveal,
+    h('h3', { class: 'eyebrow', style: { margin: '20px 0 6px' } }, 'Set up'),
+    guideHost,
+    h('h3', { class: 'eyebrow', style: { margin: '22px 0 6px' } }, 'Your tokens'),
+    list,
+  );
+  dlg.addEventListener('close', () => dlg.remove());
+  dlg.addEventListener('click', (e) => e.target === dlg && dlg.close());
+  document.body.append(dlg);
+  dlg.showModal();
+
+  async function refresh() {
+    const r = await api('/api/tokens');
+    info = r;
+    if (!guideHost.children.length) guideHost.replaceChildren(setupGuides(info, null));
+    list.replaceChildren(
+      ...(r.tokens.length
+        ? r.tokens.map((t) =>
+            h(
+              'div',
+              { class: 'pk' },
+              h('span', { class: 'pk-icon' }, keyIcon()),
+              h('div', { style: { minWidth: 0 } }, h('div', { class: 'name' }, t.name, t.readOnly ? h('span', { class: 'tag known' }, 'read-only') : null), h('div', { class: 'mono muted' }, `${t.hint} · made ${new Date(t.createdAt).toLocaleDateString()}`, t.lastUsedAt ? ` · used ${ago(t.lastUsedAt)}` : ' · not used yet')),
+              h('button', {
+                class: 'linkish',
+                onClick: async () => {
+                  if (!confirm(`Revoke “${t.name}”? Anything using it stops working.`)) return;
+                  await api(`/api/tokens/${t.id}`, { method: 'DELETE' });
+                  refresh();
+                },
+              }, 'Revoke'),
+            ),
+          )
+        : [h('p', { class: 'muted' }, 'No tokens yet.')]),
+    );
+  }
+  try {
+    await refresh();
   } catch (err) {
     toast(err.message, { error: true });
   }

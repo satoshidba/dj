@@ -5,6 +5,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY server ./server
 COPY public ./public
+COPY cli ./cli
+COPY skills ./skills
 RUN mkdir -p /data && chown node:node /data
 USER node
 ENV DATA_DIR=/data PORT=8080

@@ -897,3 +897,22 @@ label.btn { cursor: pointer; }
 .sleepsel option { color: #121110; }
 .kctl { flex-wrap: wrap; }
 .zz { color: var(--ink-2); }
+
+/* ======================================================= agents & api */
+.sheet.wide { width: min(720px, calc(100vw - 32px)); }
+.tok-new { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; }
+.kfield-input { flex: 1 1 220px; height: 40px; padding: 0 14px; border-radius: 999px; border: 1px solid var(--line-strong); background: var(--paper); }
+.tok-reveal { margin-top: 16px; padding: 14px 16px; border-radius: var(--r); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.tok-reveal p { margin: 4px 0 10px; }
+.tok-row { display: flex; gap: 10px; align-items: center; }
+.tok-row code { flex: 1; min-width: 0; overflow-wrap: anywhere; font-family: var(--mono); font-size: 12.5px; background: var(--card); padding: 8px 10px; border-radius: 8px; }
+.guides .seg { margin-bottom: 12px; }
+.guide-body { display: grid; gap: 12px; }
+.snip { border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; background: var(--paper); }
+.snip-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 13.5px; }
+.snip p { margin: 4px 0 0; }
+.snip pre { margin: 8px 0 0; padding: 10px 12px; border-radius: 8px; background: var(--paper-2); overflow-x: auto; font-family: var(--mono); font-size: 12px; line-height: 1.5; white-space: pre; }
+.btn.copy { height: 30px; padding: 0 12px; font-size: 12.5px; }
+.guide-body, .guides, .snip { min-width: 0; }
+.guide-body { grid-template-columns: minmax(0, 1fr); }
+.sheet { overflow-x: hidden; }

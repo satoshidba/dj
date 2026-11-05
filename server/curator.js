@@ -212,7 +212,7 @@ function score(candidate, want) {
   return title * 0.6 + artist * 0.4;
 }
 
-async function resolve(sp, want, { clean = false } = {}) {
+export async function resolve(sp, want, { clean = false } = {}) {
   const strip = (s) => s.replace(/"/g, '');
   const queries = [`track:"${strip(want.title)}" artist:"${strip(want.artist)}"`, `${want.title} ${want.artist}`];
   let best = null;
