@@ -8,7 +8,7 @@ const FILE = path.join(DATA_DIR, 'store.json');
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
-let state = { users: {}, sessions: {}, backups: {}, likedPlaylist: {} };
+let state = { users: {}, sessions: {}, backups: {}, likedPlaylist: {}, kids: [], kidsPlaylists: {} };
 try {
   state = { ...state, ...JSON.parse(fs.readFileSync(FILE, 'utf8')) };
 } catch (err) {
@@ -55,6 +55,19 @@ export const store = {
   getLikedPlaylist: (userId) => state.likedPlaylist[userId] ?? null,
   setLikedPlaylist(userId, playlistId) {
     state.likedPlaylist[userId] = playlistId;
+    save();
+  },
+
+  // Kids profiles are shared by the household; their playlists live on
+  // whichever grown-up's Spotify account made them.
+  kids: () => state.kids,
+  setKids(kids) {
+    state.kids = kids;
+    save();
+  },
+  kidsPlaylists: (userId) => state.kidsPlaylists[userId] ?? [],
+  setKidsPlaylists(userId, list) {
+    state.kidsPlaylists[userId] = list;
     save();
   },
 };

@@ -25,6 +25,10 @@ const ARTISTS = {
   'Biffy Clyro': ['Bubbles', 'Mountains'],
   'Idles': ['Never Fight a Man with a Perm'],
   'Fontaines D.C.': ['Boys in the Better Land', 'Jackie Down the Line'],
+  'The Wiggles': ['Hot Potato', 'Fruit Salad', 'Rock-a-Bye Your Bear'],
+  'Idina Menzel': ['Let It Go'],
+  'Lin-Manuel Miranda': ['We Don’t Talk About Bruno', 'How Far I’ll Go'],
+  'ABBA': ['Dancing Queen', 'Mamma Mia', 'Waterloo'],
   'Johann Sebastian Bach': ['Goldberg Variations, BWV 988: Aria', 'Cello Suite No. 1 in G Major, BWV 1007: I. Prélude'],
   'Erik Satie': ['Gymnopédie No. 1'],
 };
@@ -45,6 +49,7 @@ for (const [artist, songs] of Object.entries(ARTISTS)) {
       type: 'track',
       name: title,
       duration_ms: 150000 + ((i * 37013) % 120000),
+      explicit: title === 'Killing in the Name' || title === 'Hot Potato',
       artists: [artistObj(artist)].map(({ id, name }) => ({ id, name })),
       album: { id: `al_${slug(artist)}_${i % 3}`, name: `${artist} Album ${(i % 3) + 1}`, images: [{ url: img(artist + (i % 3), 64), width: 64 }] },
     });
@@ -53,7 +58,9 @@ for (const [artist, songs] of Object.entries(ARTISTS)) {
 // A feature, to prove collaborators count.
 ALL.push({ id: 'tr_feat', uri: 'spotify:track:tr_feat', type: 'track', name: 'Collab Track', duration_ms: 200000, artists: [{ id: 'ar_foofighters', name: 'Foo Fighters' }, { id: 'ar_royalblood', name: 'Royal Blood' }], album: { id: 'al_feat', name: 'Collabs', images: [] } });
 
-const me = { id: 'alex', display_name: 'Alex', images: [] };
+const USERS = { alex: { id: 'alex', display_name: 'Alex', images: [] }, sam: { id: 'sam', display_name: 'Sam', images: [] } };
+let nextLogin = 'alex';
+const whoFrom = (req) => (req.headers.authorization || '').replace('Bearer at_', '') || 'alex';
 const playlists = {
   gym: { id: 'gym', name: 'Gym Rock', owner: { id: 'alex', display_name: 'Alex' }, collaborative: false, images: [{ url: img('gym', 300), width: 300 }], uris: ALL.filter((t) => !t.name.includes('Gymno') && !t.artists[0].name.includes('Bach')).map((t) => t.uri) },
   road: { id: 'road', name: 'Road Trip 2026', owner: { id: 'alex', display_name: 'Alex' }, collaborative: true, images: [], uris: ALL.slice(10, 70).map((t) => t.uri) },
@@ -63,6 +70,10 @@ const byUri = new Map(ALL.map((t) => [t.uri, t]));
 let created = 0;
 
 export const mockState = { playlists };
+const player = { is_playing: false, device: { name: 'Car (iPhone)' }, item: null, context: null };
+// 40 plays over the last few hours, some from the Gym Rock playlist.
+const recent = ALL.slice(0, 40).map((t, i) => ({ track: t, played_at: new Date(Date.now() - (40 - i) * 4 * 60_000).toISOString(), context: i % 3 ? { uri: 'spotify:playlist:gym' } : null })).reverse();
+const recentSam = ALL.slice(15, 45).map((t, i) => ({ track: t, played_at: new Date(Date.now() - (30 - i) * 5 * 60_000).toISOString(), context: null })).reverse();
 
 function send(res, status, body, headers = {}) {
   res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
@@ -82,6 +93,25 @@ function page(items, url, limit) {
   return { items: slice, total: items.length, limit, offset, next };
 }
 const plSummary = (p) => ({ id: p.id, name: p.name, description: '', owner: p.owner, collaborative: p.collaborative, images: p.images, snapshot_id: 'snap', items: { total: p.uris.length }, external_urls: { spotify: `https://open.spotify.com/playlist/${p.id}` } });
+
+function kidsAnswer() {
+  const pick = (artist, title, why, known = false) => ({ artist, title, est_bpm: 0, why, known });
+  return {
+    title: 'Back-Seat Choir',
+    description: 'Big singalongs for the car that grown-ups won’t mind on repeat.',
+    tempo_target: '',
+    tracks: [
+      pick('ABBA', 'Dancing Queen', 'Everyone knows the chorus.'),
+      pick('Idina Menzel', 'Let It Go', 'Non-negotiable.', true),
+      pick('The Wiggles', 'Hot Potato', 'This one is explicit in the mock, so it gets filtered.'),
+      pick('Lin-Manuel Miranda', 'We Don’t Talk About Bruno', 'Parts for the whole family.'),
+      pick('The Wiggles', 'Fruit Salad', 'For the littlest one.'),
+      pick('ABBA', 'Waterloo', 'Stompy and short.'),
+      pick('Lin-Manuel Miranda', 'How Far I’ll Go', 'Big finish.'),
+    ],
+    alternates: [pick('ABBA', 'Mamma Mia', 'Backup singalong.'), pick('The Wiggles', 'Rock-a-Bye Your Bear', 'Silly actions.')],
+  };
+}
 
 // Canned curator answer.
 function curatorAnswer() {
@@ -122,7 +152,7 @@ export function startMock(port = PORT) {
     const url = new URL(req.url, BASE);
     const p = url.pathname;
     const raw = await readBody(req);
-    const body = raw ? JSON.parse(raw.startsWith('{') ? raw : '{}') : {};
+    const body = raw && raw.startsWith('{') ? JSON.parse(raw) : {};
 
     // ---- accounts
     if (p === '/accounts/authorize') {
@@ -132,18 +162,28 @@ export function startMock(port = PORT) {
       res.writeHead(302, { Location: to.toString() });
       return res.end();
     }
-    if (p === '/accounts/api/token') return send(res, 200, { access_token: 'at', refresh_token: 'rt', expires_in: 3600 });
+    if (p === '/mock/next-login') {
+      nextLogin = url.searchParams.get('user');
+      return send(res, 200, { ok: true });
+    }
+    if (p === '/accounts/api/token') {
+      const form = new URLSearchParams(raw);
+      const u = form.get('grant_type') === 'refresh_token' ? form.get('refresh_token').slice(3) : nextLogin;
+      return send(res, 200, { access_token: `at_${u}`, refresh_token: `rt_${u}`, expires_in: 3600, scope: 'user-read-playback-state user-modify-playback-state' });
+    }
 
     // ---- anthropic
     if (p === '/anthropic/v1/messages') {
       await new Promise((r) => setTimeout(r, 900));
-      return sse(res, JSON.stringify(curatorAnswer()));
+      const isKids = JSON.stringify(body.system ?? '').includes('for children');
+      return sse(res, JSON.stringify(isKids ? kidsAnswer() : curatorAnswer()));
     }
 
     // ---- web api
     if (!p.startsWith('/v1')) return send(res, 404, { error: { message: 'nope' } });
     const path = p.slice(3);
     let m;
+    const me = USERS[whoFrom(req)] ?? USERS.alex;
     if (path === '/me') return send(res, 200, me);
     if (path === '/me/playlists' && req.method === 'GET') return send(res, 200, page(Object.values(playlists).map(plSummary), url, 50));
     if (path === '/me/playlists' && req.method === 'POST') {
@@ -180,7 +220,26 @@ export function startMock(port = PORT) {
     }
     if (path === '/me/top/artists') return send(res, 200, { items: Object.keys(ARTISTS).slice(0, 12).map(artistObj) });
     if (path === '/me/top/tracks') return send(res, 200, { items: ALL.slice(0, 20) });
-    if (path === '/me/player/recently-played') return send(res, 200, { items: ALL.slice(5, 30).map((t) => ({ track: t })) });
+    if (path === '/me/player/recently-played') {
+      const after = Number(url.searchParams.get('after') || 0);
+      const items = (me.id === 'sam' ? recentSam : recent).filter((r) => Date.parse(r.played_at) > after).slice(0, 50);
+      return send(res, 200, { items });
+    }
+    if (path === '/me/player' && req.method === 'GET') return player.item ? send(res, 200, player) : send(res, 204);
+    if (path === '/me/player/devices') return send(res, 200, { devices: [{ id: 'car', name: 'Car (iPhone)', is_active: true, is_restricted: false }] });
+    if (path === '/me/player/play') {
+      if (body.context_uri) {
+        const id = body.context_uri.split(':').pop();
+        player.context = { uri: body.context_uri };
+        player.queue = [...(playlists[id]?.uris ?? [])];
+        player.item = byUri.get(player.queue.shift());
+      }
+      player.is_playing = true;
+      return send(res, 204);
+    }
+    if (path === '/me/player/pause') { player.is_playing = false; return send(res, 204); }
+    if (path === '/me/player/next') { player.item = byUri.get(player.queue?.shift()) ?? player.item; return send(res, 204); }
+    if (path === '/me/player/shuffle') return send(res, 204);
     if (path === '/search') {
       const q = url.searchParams.get('q').toLowerCase().replace(/track:|artist:|"/g, ' ');
       const words = q.split(/\s+/).filter(Boolean);

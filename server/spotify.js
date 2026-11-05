@@ -24,7 +24,12 @@ export const SCOPES = [
   'user-library-read',
   'user-top-read',
   'user-read-recently-played',
+  // Kids mode starts and skips music on whatever device is playing.
+  'user-read-playback-state',
+  'user-modify-playback-state',
 ].join(' ');
+
+export const PLAYBACK_SCOPES = ['user-read-playback-state', 'user-modify-playback-state'];
 
 const cfg = () => ({
   clientId: process.env.SPOTIFY_CLIENT_ID,
@@ -58,6 +63,7 @@ async function tokenRequest(params) {
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new SpotifyError(res.status, body.error_description || body.error || 'token request failed');
   return {
+    scope: body.scope,
     accessToken: body.access_token,
     refreshToken: body.refresh_token,
     expiresAt: Date.now() + body.expires_in * 1000,
@@ -85,6 +91,7 @@ export function spotifyFor(userId) {
     const fresh = await tokenRequest({ grant_type: 'refresh_token', refresh_token: user.tokens.refreshToken });
     // Spotify may or may not rotate the refresh token.
     fresh.refreshToken ||= user.tokens.refreshToken;
+    fresh.scope ||= user.tokens.scope;
     store.putUser({ id: userId, tokens: fresh });
     return fresh.accessToken;
   }
@@ -172,8 +179,18 @@ export function spotifyFor(userId) {
       call('GET', '/me/top/artists', { query: { time_range: range, limit } }).then((r) => r?.items ?? []),
     topTracks: (range, limit = 30) =>
       call('GET', '/me/top/tracks', { query: { time_range: range, limit } }).then((r) => r?.items ?? []),
-    recentlyPlayed: () =>
-      call('GET', '/me/player/recently-played', { query: { limit: 50 } }).then((r) => r?.items ?? []),
+    recentlyPlayed: ({ after } = {}) =>
+      call('GET', '/me/player/recently-played', { query: { limit: 50, after } }).then((r) => r?.items ?? []),
+
+    // Playback (needs Premium on the listening account).
+    playerState: () => call('GET', '/me/player'),
+    devices: () => call('GET', '/me/player/devices').then((r) => r?.devices ?? []),
+    play: (contextUri, deviceId) =>
+      call('PUT', '/me/player/play', { query: { device_id: deviceId }, body: { context_uri: contextUri, offset: { position: 0 } } }),
+    resume: () => call('PUT', '/me/player/play'),
+    pause: () => call('PUT', '/me/player/pause'),
+    next: () => call('POST', '/me/player/next'),
+    setShuffle: (on, deviceId) => call('PUT', '/me/player/shuffle', { query: { state: String(on), device_id: deviceId } }),
 
     search: (q, limit = 10) =>
       call('GET', '/search', { query: { q, type: 'track', limit } }).then((r) => r?.tracks?.items ?? []),
@@ -212,6 +229,7 @@ export function simplifyTrack(t, entry = {}) {
       : { id: t.album?.id ?? null, name: t.album?.name ?? '' },
     image: pickImage(isEpisode ? t.images : t.album?.images, 64),
     durationMs: t.duration_ms ?? 0,
+    explicit: !!t.explicit,
   };
 }
 

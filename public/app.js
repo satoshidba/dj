@@ -7,7 +7,13 @@ function h(tag, props = {}, ...kids) {
   for (const [k, v] of Object.entries(props ?? {})) {
     if (v == null || v === false) continue;
     if (k === 'class') el.className = v;
-    else if (k === 'style' && typeof v === 'object') Object.assign(el.style, v);
+    else if (k === 'style' && typeof v === 'object') {
+      for (const [prop, val] of Object.entries(v)) {
+        if (val == null) continue;
+        if (prop.startsWith('--')) el.style.setProperty(prop, val);
+        else el.style[prop] = val;
+      }
+    }
     else if (k.startsWith('on')) el.addEventListener(k.slice(2).toLowerCase(), v);
     else if (k === 'html') el.innerHTML = v;
     else el.setAttribute(k, v === true ? '' : v);
@@ -57,7 +63,15 @@ const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 // Artist colours for the spread strip: the most frequent artists get a colour,
 // everyone else is neutral, so clumps are easy to spot.
-const PALETTE = ['#FF4D1A', '#2F6BFF', '#E8B200', '#19A974', '#B14CFD', '#FF7AB6', '#00A7BD', '#9B6A44'];
+// Checked for colour-blind separation against both surfaces (dataviz validator).
+const PALETTE_LIGHT = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#6250d6', '#e34948'];
+const PALETTE_DARK = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767'];
+const darkMq = matchMedia('(prefers-color-scheme: dark)');
+let PALETTE = darkMq.matches ? PALETTE_DARK : PALETTE_LIGHT;
+darkMq.addEventListener('change', () => {
+  PALETTE = darkMq.matches ? PALETTE_DARK : PALETTE_LIGHT;
+  render();
+});
 function colourise(tracks) {
   const counts = new Map();
   for (const t of tracks) {
@@ -170,8 +184,17 @@ const state = {
 
 function route() {
   const [, tab, id] = location.hash.split('/');
-  state.tab = tab === 'brief' ? 'brief' : 'deal';
+  state.tab = ['brief', 'plays', 'kids'].includes(tab) ? tab : 'deal';
+  state.kidsScreen = tab === 'kids' && id === 'play';
+  if (state.kidsScreen) {
+    setKidsDevice(true);
+  } else if (kidsDevice() && state.session.user) {
+    // This device lives in Kids mode; only the hold-to-exit button leaves it.
+    location.replace('#/kids/play');
+    return;
+  }
   const nextSel = state.tab === 'deal' && id ? decodeURIComponent(id) : null;
+  if (state.tab === 'plays') state.history = null;
   if (nextSel !== state.selected) {
     state.selected = nextSel;
     state.detail = null;
@@ -190,7 +213,9 @@ let strip = null;
 function render() {
   strip?.ro.disconnect();
   strip = null;
-  app.replaceChildren(state.session.user ? appShell() : landing());
+  stopPlayerPoll();
+  if (!state.session.user) return app.replaceChildren(landing());
+  app.replaceChildren(state.kidsScreen ? kidsScreen() : appShell());
 }
 
 // ---------------------------------------------------------------- landing --
@@ -316,8 +341,8 @@ function appShell() {
   return h(
     'div',
     {},
-    h('header', { class: 'top' }, h('a', { class: 'wordmark', href: '#/deal' }, 'dj', h('i', {}, '.')), h('nav', { class: 'tabs', role: 'tablist' }, tab('deal', 'Deal'), tab('brief', 'Brief')), menuHost),
-    state.tab === 'brief' ? briefView() : dealView(),
+    h('header', { class: 'top' }, h('a', { class: 'wordmark', href: '#/deal' }, 'dj', h('i', {}, '.')), h('nav', { class: 'tabs', role: 'tablist' }, tab('deal', 'Deal'), tab('brief', 'Brief'), tab('plays', 'Plays'), tab('kids', 'Kids')), menuHost),
+    { brief: briefView, plays: playsView, kids: kidsView }[state.tab]?.() ?? dealView(),
   );
 }
 
@@ -345,7 +370,7 @@ async function loadPlaylists() {
     toast(err.message, { error: true });
     state.playlists = [];
   }
-  if (state.tab === 'deal') render();
+  if (state.tab === 'deal' || state.tab === 'kids') render();
 }
 
 async function loadDetail(id) {
@@ -750,7 +775,7 @@ function knowsView() {
 }
 
 const STEP_TEXT = {
-  taste: 'Reading your listening history',
+  taste: 'Reading listening history',
   curating: 'Curating. Usually 20 to 60 seconds',
   matching: 'Finding each track on Spotify',
 };
@@ -763,8 +788,10 @@ function progressView(steps) {
   );
 }
 
-async function runBrief() {
-  const b = state.brief;
+const runBrief = () => streamBrief(state.brief, '/api/brief', () => ({ brief: state.brief.text, length: state.brief.length, familiarity: state.brief.fam }));
+
+/** Run a brief against an NDJSON endpoint, updating `b.steps` / `b.result`. */
+async function streamBrief(b, url, makeBody) {
   if (b.running || !b.text.trim()) {
     if (!b.text.trim()) toast('Say what the playlist is for.');
     return;
@@ -787,10 +814,10 @@ async function runBrief() {
   };
 
   try {
-    const res = await fetch('/api/brief', {
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'x-dj': '1', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ brief: b.text, length: b.length, familiarity: b.fam }),
+      body: JSON.stringify(makeBody()),
     });
     if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Request failed');
     const reader = res.body.getReader();
@@ -897,6 +924,702 @@ function resultView(b) {
       ),
     ),
   );
+}
+
+
+// ------------------------------------------------------------------ plays --
+
+const RANGE_LABELS = [['7d', '7 days'], ['30d', '30 days'], ['90d', '90 days'], ['365d', 'Year'], ['all', 'All time']];
+state.plays = { range: '30d', who: 'me', audience: 'grown' };
+const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+async function loadHistory() {
+  const q = new URLSearchParams({ ...state.plays, tz });
+  const key = q.toString();
+  state.historyKey = key;
+  try {
+    const data = await api(`/api/history?${q}`);
+    if (state.historyKey !== key) return;
+    state.history = data;
+  } catch (err) {
+    toast(err.message, { error: true });
+    state.history = { error: true };
+  }
+  if (state.tab === 'plays') render();
+}
+
+function segmented(options, value, onPick, label) {
+  return h(
+    'div',
+    { class: 'seg', role: 'radiogroup', 'aria-label': label },
+    options.map(([v, l]) => h('button', { role: 'radio', 'aria-checked': String(v === value), onClick: () => onPick(v) }, l)),
+  );
+}
+
+function playsView() {
+  if (!state.history) loadHistory();
+  const H = state.history;
+  const set = (k) => (v) => {
+    state.plays[k] = v;
+    state.history = null;
+    render();
+  };
+  const others = state.session.others ?? [];
+
+  return h(
+    'main',
+    { class: 'plays' },
+    h('div', { class: 'eyebrow' }, 'Plays'),
+    h('h1', { class: 'page-title' }, state.plays.audience === 'kids' ? 'What the kids ' : 'What you’ve been ', h('em', {}, 'playing.')),
+    h(
+      'div',
+      { class: 'filters' },
+      segmented(RANGE_LABELS, state.plays.range, set('range'), 'Time range'),
+      others.length ? segmented([['me', 'Me'], ['both', `Both of us`]], state.plays.who, set('who'), 'Whose plays') : null,
+      segmented([['grown', 'Grown-ups'], ['kids', 'Kids']], state.plays.audience, set('audience'), 'Audience'),
+    ),
+    !H ? h('div', { class: 'skeleton', style: { height: '320px', marginTop: '28px' } }) : H.error ? null : historyBody(H),
+    H && !H.error ? trackingPanel(H.tracking) : null,
+  );
+}
+
+function historyBody(H) {
+  const S = H.summary;
+  if (!S.plays) {
+    return h(
+      'div',
+      { class: 'empty-plays' },
+      h('div', { class: 'serif' }, state.plays.audience === 'kids' ? 'No Kids mode plays here yet.' : 'Nothing logged in this range yet.'),
+      h('p', { class: 'muted' }, state.plays.audience === 'kids' ? 'Plays from Kids mode playlists show up here, kept apart from your own.' : `dj checks Spotify every ${H.tracking.every} minutes and keeps every play. Import your Spotify data below to fill in the years before.`),
+    );
+  }
+  return h(
+    'div',
+    {},
+    h(
+      'div',
+      { class: 'tiles' },
+      tile(S.plays.toLocaleString(), 'plays'),
+      tile(Math.round(S.ms / 3_600_000).toLocaleString(), 'hours'),
+      tile(S.artistCount.toLocaleString(), 'artists'),
+      tile(S.longestStreak, `day${S.longestStreak === 1 ? '' : 's'} in a row, best run`),
+    ),
+    H.who === 'both' && H.people ? h('p', { class: 'muted split' }, H.people.map((p) => `${p.name}: ${p.plays.toLocaleString()}`).join(' · ')) : null,
+    h('section', { class: 'chart-card panel' }, h('div', { class: 'chart-head' }, h('h2', {}, 'Plays over time'), h('span', { class: 'mono muted' }, bucketLabel(S.days))), dayChart(S.days)),
+    h(
+      'div',
+      { class: 'two-col' },
+      h('section', { class: 'panel' }, h('h2', {}, 'Top artists'), barList(S.topArtists.slice(0, 10).map((a) => ({ label: a.name, value: a.plays })))),
+      h('section', { class: 'panel' }, h('h2', {}, 'Top tracks'), trackRank(S.topTracks.slice(0, 10))),
+    ),
+    H.who === 'both' && H.shared?.length
+      ? h('section', { class: 'panel', style: { marginTop: '20px' } }, h('h2', {}, 'You both play'), sharedList(H.shared, H.people))
+      : null,
+    h('section', { class: 'panel', style: { marginTop: '20px' } }, h('div', { class: 'chart-head' }, h('h2', {}, 'When you listen'), h('span', { class: 'mono muted' }, tz.replace(/_/g, ' '))), heatmap(S.clock)),
+    h('section', { class: 'recent' }, h('h2', { class: 'eyebrow' }, 'Latest'), S.recent.slice(0, 15).map((r) => h('div', { class: 'rrow' }, h('div', { class: `cover art${r.image ? '' : ' blank'}`, style: r.image ? { backgroundImage: `url("${r.image}")` } : null }), h('div', { style: { minWidth: 0 } }, h('div', { class: 'name' }, r.name), h('div', { class: 'by' }, r.artist)), h('span', { class: 'mono muted' }, ago(r.at))))),
+  );
+}
+
+const tile = (v, k) => h('div', { class: 'tile' }, h('div', { class: 'v' }, v), h('div', { class: 'k' }, k));
+
+function ago(at) {
+  const m = Math.round((Date.now() - at) / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m} min ago`;
+  const hr = Math.round(m / 60);
+  if (hr < 24) return `${hr} hr ago`;
+  const d = Math.round(hr / 24);
+  return d < 30 ? `${d} day${d === 1 ? '' : 's'} ago` : new Date(at).toLocaleDateString();
+}
+
+// Long ranges get grouped into weeks or months so bars stay readable.
+function bucketDays(days) {
+  if (days.length <= 120) return { unit: 'day', rows: fillDays(days) };
+  const unit = days.length <= 730 ? 'week' : 'month';
+  const m = new Map();
+  for (const d of days) {
+    const dt = new Date(`${d.day}T00:00:00Z`);
+    let key;
+    if (unit === 'week') {
+      const monday = new Date(dt);
+      monday.setUTCDate(dt.getUTCDate() - ((dt.getUTCDay() + 6) % 7));
+      key = monday.toISOString().slice(0, 10);
+    } else key = d.day.slice(0, 7);
+    m.set(key, (m.get(key) ?? 0) + d.plays);
+  }
+  return { unit, rows: [...m.entries()].map(([day, plays]) => ({ day, plays })) };
+}
+function fillDays(days) {
+  if (!days.length) return [];
+  const out = [];
+  const have = new Map(days.map((d) => [d.day, d.plays]));
+  const start = new Date(`${days[0].day}T00:00:00Z`);
+  const end = new Date(`${days.at(-1).day}T00:00:00Z`);
+  for (let t = start; t <= end; t = new Date(t.getTime() + 86_400_000)) {
+    const k = t.toISOString().slice(0, 10);
+    out.push({ day: k, plays: have.get(k) ?? 0 });
+  }
+  return out;
+}
+const bucketLabel = (days) => `per ${bucketDays(days).unit}`;
+
+let tip = null;
+function showTip(e, html) {
+  tip ??= document.body.appendChild(h('div', { class: 'tip', role: 'tooltip' }));
+  tip.innerHTML = html;
+  tip.style.opacity = '1';
+  const r = tip.getBoundingClientRect();
+  const x = Math.min(innerWidth - r.width - 8, Math.max(8, e.clientX - r.width / 2));
+  const y = e.clientY - r.height - 14;
+  tip.style.transform = `translate(${x}px, ${y < 8 ? e.clientY + 18 : y}px)`;
+}
+const hideTip = () => tip && (tip.style.opacity = '0');
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+
+function dayChart(days) {
+  const { unit, rows } = bucketDays(days);
+  const max = Math.max(1, ...rows.map((r) => r.plays));
+  const nice = niceMax(max);
+  const fmt = (d) => (unit === 'month' ? new Date(`${d}-01T00:00:00Z`).toLocaleDateString(undefined, { month: 'short', year: 'numeric', timeZone: 'UTC' }) : new Date(`${d}T00:00:00Z`).toLocaleDateString(undefined, { day: 'numeric', month: 'short', timeZone: 'UTC' }));
+  return h(
+    'div',
+    { class: 'cols-wrap' },
+    h('div', { class: 'y-axis mono' }, h('span', {}, nice), h('span', {}, Math.round(nice / 2)), h('span', {}, 0)),
+    h(
+      'div',
+      { class: 'cols', role: 'img', 'aria-label': `Plays per ${unit}` },
+      h('div', { class: 'grid' }, h('i'), h('i'), h('i')),
+      rows.map((r, i) =>
+        h(
+          'div',
+          {
+            class: 'col',
+            onPointerMove: (e) => showTip(e, `<b>${r.plays.toLocaleString()}</b> plays<br><span>${unit === 'week' ? 'Week of ' : ''}${fmt(r.day)}</span>`),
+            onPointerLeave: hideTip,
+          },
+          h('span', { class: 'bar', style: { height: `${(r.plays / nice) * 100}%`, animationDelay: `${Math.min(i, 60) * 8}ms` } }),
+        ),
+      ),
+    ),
+    h('div', { class: 'x-axis mono muted' }, h('span', {}, rows[0] ? fmt(rows[0].day) : ''), h('span', {}, rows.at(-1) ? fmt(rows.at(-1).day) : '')),
+  );
+}
+function niceMax(v) {
+  const p = 10 ** Math.floor(Math.log10(v));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p;
+  return 10 * p;
+}
+
+function barList(items) {
+  const max = Math.max(1, ...items.map((i) => i.value));
+  return h(
+    'ol',
+    { class: 'barlist' },
+    items.map((it, i) =>
+      h(
+        'li',
+        {},
+        h('span', { class: 'rank mono' }, i + 1),
+        h('div', { class: 'bl-body' }, h('div', { class: 'bl-label' }, h('span', {}, it.label), h('span', { class: 'mono' }, it.value.toLocaleString())), h('div', { class: 'bl-track' }, h('span', { style: { width: `${(it.value / max) * 100}%`, animationDelay: `${i * 40}ms` } }))),
+      ),
+    ),
+  );
+}
+
+function trackRank(tracks) {
+  return h(
+    'ol',
+    { class: 'trank' },
+    tracks.map((t, i) => h('li', {}, h('span', { class: 'rank mono' }, i + 1), h('div', { class: `cover art${t.image ? '' : ' blank'}`, style: t.image ? { backgroundImage: `url("${t.image}")` } : null }), h('div', { style: { minWidth: 0 } }, h('div', { class: 'name' }, t.name), h('div', { class: 'by' }, t.artist)), h('span', { class: 'mono muted' }, `×${t.plays}`))),
+  );
+}
+
+function sharedList(shared, people) {
+  const [a, b] = people;
+  return h(
+    'table',
+    { class: 'shared' },
+    h('thead', {}, h('tr', {}, h('th', {}, 'Artist'), h('th', { class: 'num' }, a.name), h('th', { class: 'num' }, b.name))),
+    h('tbody', {}, shared.map((s) => h('tr', {}, h('td', {}, s.name), h('td', { class: 'num mono' }, s.a), h('td', { class: 'num mono' }, s.b)))),
+  );
+}
+
+function heatmap(clock) {
+  const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const max = Math.max(1, ...clock.flat());
+  return h(
+    'div',
+    { class: 'heat-wrap' },
+    h(
+      'div',
+      { class: 'heat', role: 'img', 'aria-label': 'Plays by weekday and hour' },
+      clock.map((row, d) => [
+        h('span', { class: 'heat-day mono muted' }, days[d][0]),
+        row.map((v, hr) =>
+          h('span', {
+            class: 'cell',
+            style: { '--a': v ? 0.12 + 0.88 * (v / max) : 0 },
+            onPointerMove: (e) => showTip(e, `<b>${v}</b> plays<br><span>${days[d]} ${String(hr).padStart(2, '0')}:00</span>`),
+            onPointerLeave: hideTip,
+          }),
+        ),
+      ]),
+      h('span'),
+      Array.from({ length: 24 }, (_, hr) => h('span', { class: 'heat-hr mono muted' }, hr % 6 === 0 ? String(hr).padStart(2, '0') : '')),
+    ),
+    h('div', { class: 'heat-legend mono muted' }, 'Fewer', h('span', { class: 'ramp' }), 'More'),
+  );
+}
+
+function trackingPanel(t) {
+  const fileInput = h('input', { type: 'file', accept: '.json,application/json', multiple: true, class: 'sr', onChange: (e) => importFiles([...e.target.files]) });
+  const last = t.last;
+  return h(
+    'section',
+    { class: 'tracking' },
+    h(
+      'div',
+      { class: 'panel' },
+      h('h2', {}, 'Play log'),
+      h(
+        'p',
+        {},
+        t.on ? h('span', { class: 'live-dot', 'aria-hidden': 'true' }) : null,
+        t.on ? `Checking Spotify every ${t.every} minutes` : 'Paused',
+        t.since ? `, logging since ${new Date(t.since).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}.` : '.',
+        last ? h('span', { class: 'muted' }, ` Last check ${ago(last.at)}${last.ok ? (last.added ? `, ${last.added} new` : ', nothing new') : `, failed: ${last.error}`}.`) : null,
+      ),
+      last?.gap ? h('p', { class: 'callout' }, 'More than 50 plays happened between two checks, so a few may be missing. Spotify only lets apps see the last 50.') : null,
+      h(
+        'div',
+        { class: 'actions' },
+        h('button', { class: 'btn ghost small', onClick: async (e) => { e.target.disabled = true; await api('/api/history/poll', { method: 'POST' }).catch((err) => toast(err.message, { error: true })); state.history = null; render(); } }, 'Check now'),
+        h('button', { class: 'linkish', onClick: async () => { await api('/api/history/tracking', { method: 'PUT', body: { on: !t.on } }); state.history = null; render(); } }, t.on ? 'Pause logging' : 'Resume logging'),
+      ),
+    ),
+    h(
+      'div',
+      { class: 'panel' },
+      h('h2', {}, t.imported ? 'Import more history' : 'Fill in the years before'),
+      h('p', {}, 'Spotify will send you your entire listening history if you ask:'),
+      h(
+        'ol',
+        { class: 'steps-list' },
+        h('li', {}, 'Open ', h('a', { href: 'https://www.spotify.com/account/privacy/', target: '_blank', rel: 'noopener' }, 'spotify.com → Account → Privacy'), '.'),
+        h('li', {}, 'Tick ', h('b', {}, 'Extended streaming history'), ' and request it. Spotify emails a link, usually within a few days (they say up to 30).'),
+        h('li', {}, 'Unzip it and pick the ', h('code', {}, 'Streaming_History_Audio_*.json'), ' files here.'),
+      ),
+      h('label', { class: 'btn small' }, 'Choose files', fileInput),
+      h('div', { id: 'import-status', class: 'mono muted', style: { marginTop: '10px' } }),
+    ),
+  );
+}
+
+async function importFiles(files) {
+  const status = document.getElementById('import-status');
+  let added = 0;
+  let skipped = 0;
+  for (const [i, f] of files.entries()) {
+    status.textContent = `Reading ${f.name} (${i + 1} of ${files.length})…`;
+    let rows;
+    try {
+      rows = JSON.parse(await f.text());
+      if (!Array.isArray(rows)) throw new Error();
+    } catch {
+      toast(`${f.name} isn’t a streaming history file.`, { error: true });
+      continue;
+    }
+    // Only send the fields the server reads; the export has dozens.
+    const slim = rows.map((r) => ({ ts: r.ts, ms_played: r.ms_played, master_metadata_track_name: r.master_metadata_track_name, master_metadata_album_artist_name: r.master_metadata_album_artist_name, master_metadata_album_album_name: r.master_metadata_album_album_name, spotify_track_uri: r.spotify_track_uri }));
+    for (let j = 0; j < slim.length; j += 20000) {
+      const r = await api('/api/history/import', { method: 'POST', body: { rows: slim.slice(j, j + 20000) } });
+      added += r.added;
+      skipped += r.skipped;
+      status.textContent = `${f.name}: ${added.toLocaleString()} plays added so far`;
+    }
+  }
+  status.textContent = `Done. ${added.toLocaleString()} plays added${skipped ? `, ${skipped.toLocaleString()} already logged or overlapping` : ''}.`;
+  toast(`Imported ${added.toLocaleString()} plays.`);
+  state.history = null;
+  setTimeout(render, 1200);
+}
+
+// ------------------------------------------------------- kids: setup page --
+
+const KIDS_KEY = 'dj_kids_device';
+const kidsDevice = () => {
+  try {
+    return localStorage.getItem(KIDS_KEY) === '1';
+  } catch {
+    return false;
+  }
+};
+const setKidsDevice = (on) => {
+  try {
+    on ? localStorage.setItem(KIDS_KEY, '1') : localStorage.removeItem(KIDS_KEY);
+  } catch {
+    /* private mode: kids mode just won't stick */
+  }
+};
+
+const KID_PRESETS = [
+  ['🚗', 'Car singalong', 'Songs the whole car can sing along to on a drive.'],
+  ['🌙', 'Bedtime', 'Calm, gentle wind-down songs for bedtime. Soft and slow all the way through.'],
+  ['💃', 'Kitchen disco', 'Dance party in the kitchen. Upbeat, silly, impossible not to move to.'],
+  ['☀️', 'Wake up', 'Bright, happy songs for getting ready in the morning.'],
+  ['🎬', 'Films & TV', 'The best songs from films and TV shows they’d know.'],
+  ['🧩', 'Quiet play', 'Low-key background music for drawing, Lego and quiet play.'],
+];
+const KID_EMOJI = ['🎵', '🚗', '🌙', '💃', '☀️', '🎬', '🧩', '🦖', '🚀', '🦄', '🐠', '⚽', '🌈', '🐶'];
+
+state.kids = null;
+state.kidsBrief = { text: '', length: 20, tolerance: 0.5, kidIds: [], emoji: '🎵', running: false, steps: [], result: null };
+
+async function loadKids() {
+  try {
+    state.kids = await api('/api/kids');
+  } catch (err) {
+    toast(err.message, { error: true });
+    state.kids = { profiles: [], playlists: [] };
+  }
+  if (state.tab === 'kids' || state.kidsScreen) render();
+}
+
+function kidsView() {
+  if (!state.kids) loadKids();
+  const K = state.kids;
+  const b = state.kidsBrief;
+  return h(
+    'main',
+    { class: 'kidsadmin' },
+    h('div', { class: 'eyebrow' }, 'Kids'),
+    h('h1', { class: 'page-title' }, 'Kids ', h('em', {}, 'mode.')),
+    h(
+      'div',
+      { class: 'kids-hero panel' },
+      h('div', {}, h('p', { class: 'lead' }, 'Turns this phone or tablet into big picture buttons that start their music on the car stereo or the speaker. Every tap is a fresh deal. No menus, no search, and they can’t wander into your stuff: getting out needs a long press.'), h('p', { class: 'muted small' }, 'Kids plays are logged separately and kept out of your own stats and AI picks. In Spotify, you can also turn on “Exclude from your Taste Profile” for these playlists so Spotify’s own recommendations stay yours.')),
+      h('button', { class: 'btn accent big', disabled: !K?.playlists.length, onClick: () => (location.hash = '#/kids/play') }, 'Start Kids mode', h('span', { 'aria-hidden': 'true' }, '→')),
+    ),
+    !state.session.playback
+      ? h('div', { class: 'callout' }, 'dj needs one more permission to start music for you. ', h('button', { class: 'linkish', onClick: () => logout(true) }, 'Log in again to allow it'), '. Starting music also needs Spotify Premium.')
+      : null,
+    !K
+      ? h('div', { class: 'skeleton', style: { height: '200px', marginTop: '24px' } })
+      : [
+          h('h2', { class: 'section-h' }, 'Their buttons'),
+          kidsTiles(K.playlists),
+          addExisting(K.playlists),
+          h('h2', { class: 'section-h' }, 'Who’s listening'),
+          kidProfiles(K.profiles),
+          h('h2', { class: 'section-h' }, 'Make a new one'),
+          kidsMaker(b, K.profiles),
+        ],
+  );
+}
+
+function kidsTiles(list) {
+  if (!list.length) return h('p', { class: 'muted' }, 'No buttons yet. Make one below, or add a playlist you already have.');
+  return h(
+    'div',
+    { class: 'ktiles admin' },
+    list.map((p) =>
+      h(
+        'div',
+        { class: 'ktile', style: { '--c': p.colour } },
+        h('button', { class: 'kemoji', title: 'Change picture', onClick: () => patchKids(p.id, { emoji: KID_EMOJI[(KID_EMOJI.indexOf(p.emoji) + 1) % KID_EMOJI.length] }) }, p.emoji),
+        h('div', { class: 'kname' }, p.name),
+        h(
+          'div',
+          { class: 'kctl' },
+          h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: p.redeal, onChange: (e) => patchKids(p.id, { redeal: e.target.checked }) }), 'Re-deal each play'),
+          h('button', { class: 'linkish', onClick: () => removeKids(p.id) }, 'Remove'),
+        ),
+      ),
+    ),
+  );
+}
+
+async function patchKids(id, body) {
+  const r = await api(`/api/kids/playlists/${id}`, { method: 'PATCH', body });
+  state.kids.playlists = r.playlists;
+  render();
+}
+async function removeKids(id) {
+  const r = await api(`/api/kids/playlists/${id}`, { method: 'DELETE' });
+  state.kids.playlists = r.playlists;
+  render();
+}
+
+function addExisting(list) {
+  if (!state.playlists) {
+    loadPlaylists();
+    return null;
+  }
+  const ids = new Set(list.map((p) => p.id));
+  const options = state.playlists.filter((p) => p.canEdit && !ids.has(p.id));
+  if (!options.length) return null;
+  const sel = h('select', { class: 'select', 'aria-label': 'Add one of your playlists' }, h('option', { value: '' }, 'Add one of your playlists…'), options.map((p) => h('option', { value: p.id }, p.name)));
+  sel.addEventListener('change', async () => {
+    if (!sel.value) return;
+    try {
+      const r = await api('/api/kids/playlists', { method: 'POST', body: { existingId: sel.value } });
+      state.kids.playlists = r.playlists;
+      render();
+    } catch (err) {
+      toast(err.message, { error: true });
+    }
+  });
+  return h('div', { style: { marginTop: '14px' } }, sel);
+}
+
+function kidProfiles(profiles) {
+  const list = profiles.length ? profiles : [];
+  let timer;
+  const save = () => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const r = await api('/api/kids/profiles', { method: 'PUT', body: { profiles: state.kids.profiles } }).catch((e) => toast(e.message, { error: true }));
+      if (r) state.kids.profiles = r.profiles;
+    }, 500);
+  };
+  const field = (k, key, label, attrs = {}) =>
+    h('label', { class: 'kfield' }, h('span', { class: 'eyebrow' }, label), h('input', { value: k[key] ?? '', ...attrs, onInput: (e) => { k[key] = attrs.type === 'number' ? Number(e.target.value) : e.target.value; save(); } }));
+  return h(
+    'div',
+    { class: 'kprofiles' },
+    list.map((k) =>
+      h(
+        'div',
+        { class: 'kprofile panel' },
+        h('div', { class: 'kp-row' }, field(k, 'name', 'Name', { placeholder: 'Mia' }), field(k, 'age', 'Age', { type: 'number', min: 0, max: 17, inputmode: 'numeric', style: { width: '80px' } })),
+        field(k, 'likes', 'Loves', { placeholder: 'Frozen, Bluey, Taylor Swift, anything with dinosaurs' }),
+        field(k, 'avoid', 'Please avoid', { placeholder: 'Baby Shark (for our sanity)' }),
+        h('button', { class: 'linkish', onClick: () => { state.kids.profiles = state.kids.profiles.filter((x) => x !== k); save(); render(); } }, 'Remove'),
+      ),
+    ),
+    h('button', { class: 'btn ghost small', onClick: () => { state.kids.profiles.push({ id: crypto.randomUUID(), name: '', age: null, likes: '', avoid: '' }); render(); } }, '+ Add a kid'),
+  );
+}
+
+function kidsMaker(b, profiles) {
+  const ta = h('textarea', { placeholder: 'Songs for a long drive to Grandma’s', 'aria-label': 'What is it for?', disabled: b.running, onInput: (e) => (b.text = e.target.value) });
+  ta.value = b.text;
+  const tolOut = h('output', {}, tolLabel(b.tolerance));
+  const lenOut = h('output', {}, b.length);
+  return h(
+    'div',
+    {},
+    h('div', { class: 'chips' }, KID_PRESETS.map(([emo, name, text], i) => h('button', { class: `chip${b.emoji === emo && b.text === text ? ' on' : ''}`, style: { animationDelay: `${i * 40}ms` }, disabled: b.running, onClick: () => { b.text = text; b.emoji = emo; b.name = name; render(); } }, `${emo} ${name}`))),
+    h(
+      'div',
+      { class: 'prompt', style: { marginTop: '14px' } },
+      ta,
+      h(
+        'div',
+        { class: 'prompt-foot' },
+        profiles.length > 1 ? h('div', { class: 'kidpick' }, profiles.map((k) => h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !b.kidIds.length || b.kidIds.includes(k.id), onChange: (e) => { const all = b.kidIds.length ? b.kidIds : profiles.map((p) => p.id); b.kidIds = e.target.checked ? [...new Set([...all, k.id])] : all.filter((x) => x !== k.id); } }), k.name || 'Unnamed'))) : null,
+        h('label', { class: 'knob' }, h('span', { class: 'lbl' }, h('span', { class: 'eyebrow' }, 'Length'), lenOut), h('input', { type: 'range', min: 8, max: 50, value: b.length, disabled: b.running, onInput: (e) => { b.length = +e.target.value; lenOut.textContent = b.length; } })),
+        h('label', { class: 'knob' }, h('span', { class: 'lbl' }, h('span', { class: 'eyebrow' }, 'Them ↔ Everyone'), tolOut), h('input', { type: 'range', min: 0, max: 1, step: 0.05, value: b.tolerance, disabled: b.running, onInput: (e) => { b.tolerance = +e.target.value; tolOut.textContent = tolLabel(b.tolerance); } })),
+        h('span', { class: 'spacer' }),
+        h('button', { class: 'btn accent', disabled: b.running || !state.session.ai, onClick: () => streamBrief(b, '/api/kids/brief', () => ({ brief: b.text, length: b.length, tolerance: b.tolerance, kidIds: b.kidIds })) }, b.running ? 'Working…' : 'Make it'),
+      ),
+    ),
+    !profiles.length ? h('p', { class: 'muted small' }, 'Tip: add the kids above first, with ages, so the picks fit them.') : null,
+    !state.session.ai ? h('div', { class: 'setup' }, 'Making playlists needs ', h('code', {}, 'ANTHROPIC_API_KEY'), '. You can still add playlists you already have.') : null,
+    b.steps.length ? progressView(b.steps) : null,
+    b.result ? kidsResult(b) : null,
+  );
+}
+
+const tolLabel = (t) => (t >= 0.7 ? 'fun for everyone' : t >= 0.35 ? 'mostly them' : 'all theirs');
+
+function kidsResult(b) {
+  const r = b.result;
+  const name = h('input', { class: 'result-title', value: b.name ? `${b.name}` : r.title, 'aria-label': 'Button name', onInput: (e) => (b.name = e.target.value) });
+  return h(
+    'section',
+    { class: 'result' },
+    h('div', { class: 'eyebrow' }, 'New button'),
+    h('div', { class: 'kr-head' }, h('button', { class: 'kemoji solo', style: { '--c': '#eb6834' }, title: 'Change picture', onClick: () => { b.emoji = KID_EMOJI[(KID_EMOJI.indexOf(b.emoji) + 1) % KID_EMOJI.length]; render(); } }, b.emoji), name),
+    h('p', { class: 'result-desc' }, r.description),
+    h(
+      'div',
+      {},
+      r.tracks.map((t, i) =>
+        h(
+          'div',
+          { class: 'brow' },
+          h('span', { class: 'idx' }, i + 1),
+          h('div', { class: `cover art${t.image ? '' : ' blank'}`, style: t.image ? { backgroundImage: `url("${t.image}")` } : null }),
+          h('div', { style: { minWidth: 0 } }, h('div', { class: 'name' }, t.name, t.known ? h('span', { class: 'tag known' }, 'a favourite') : null), h('div', { class: 'by' }, artistNames(t)), t.why ? h('div', { class: 'why' }, t.why) : null),
+          h('span'),
+          h('button', { class: 'x', 'aria-label': `Remove ${t.name}`, onClick: () => { r.tracks = r.tracks.filter((x) => x !== t); render(); } }, '×'),
+        ),
+      ),
+    ),
+    h('p', { class: 'muted small' }, 'Explicit tracks are filtered out automatically. Give it a listen-through anyway: you know your kids.'),
+    h(
+      'div',
+      { class: 'sticky-save' },
+      h('span', { class: 'mono' }, plural(r.tracks.length, 'track')),
+      h(
+        'span',
+        { style: { display: 'flex', gap: '8px' } },
+        h('button', { class: 'btn ghost small', onClick: () => streamBrief(b, '/api/kids/brief', () => ({ brief: b.text, length: b.length, tolerance: b.tolerance, kidIds: b.kidIds })) }, 'Try again'),
+        h('button', {
+          class: 'btn accent small',
+          disabled: !r.tracks.length,
+          onClick: async (e) => {
+            e.target.disabled = true;
+            try {
+              const res = await api('/api/kids/playlists', { method: 'POST', body: { name: b.name || r.title, description: `${r.description} Made for Kids mode by dj.`, uris: r.tracks.map((t) => t.uri), emoji: b.emoji } });
+              state.kids.playlists = res.playlists;
+              b.result = null;
+              b.steps = [];
+              b.text = '';
+              b.name = '';
+              state.playlists = null;
+              toast('Added to Kids mode.');
+              render();
+              scrollTo({ top: 0, behavior: reduced ? 'auto' : 'smooth' });
+            } catch (err) {
+              e.target.disabled = false;
+              toast(err.message, { error: true });
+            }
+          },
+        }, 'Add to Kids mode'),
+      ),
+    ),
+  );
+}
+
+// ------------------------------------------------------ kids: the screen --
+
+let playerTimer = null;
+let wakeLock = null;
+function stopPlayerPoll() {
+  clearInterval(playerTimer);
+  playerTimer = null;
+  wakeLock?.release?.().catch(() => {});
+  wakeLock = null;
+}
+
+function kidsScreen() {
+  if (!state.kids) loadKids();
+  const list = state.kids?.playlists ?? [];
+  const now = h('div', { class: 'know' });
+  const msg = h('div', { class: 'kmsg', hidden: true });
+
+  const refresh = async () => {
+    try {
+      const p = await api('/api/player');
+      renderNow(now, p);
+    } catch {
+      /* offline or no player: leave as is */
+    }
+  };
+  refresh();
+  playerTimer = setInterval(refresh, 5000);
+  // Keep the screen on in the car.
+  navigator.wakeLock?.request('screen').then((l) => (wakeLock = l)).catch(() => {});
+
+  const tap = async (p, el) => {
+    if (el.classList.contains('starting')) return;
+    el.classList.add('starting');
+    msg.hidden = true;
+    try {
+      await api(`/api/kids/play/${p.id}`, { method: 'POST' });
+      el.classList.add('go');
+      setTimeout(refresh, 1200);
+    } catch (err) {
+      msg.hidden = false;
+      msg.replaceChildren(h('div', { class: 'kmsg-emoji' }, '😴'), h('p', {}, err.message), h('a', { class: 'btn big', href: `https://open.spotify.com/playlist/${p.id}`, target: '_blank', rel: 'noopener' }, 'Open Spotify'), h('button', { class: 'linkish', onClick: () => (msg.hidden = true) }, 'Close'));
+    }
+    setTimeout(() => el.classList.remove('starting', 'go'), 900);
+  };
+
+  return h(
+    'div',
+    { class: 'kscreen' },
+    h('header', { class: 'kbar' }, h('span', { class: 'wordmark' }, 'dj', h('i', {}, '.'), h('span', { class: 'kids-word' }, 'kids')), holdToExit()),
+    !state.kids
+      ? h('div', { class: 'ktiles' }, [0, 1, 2, 3].map(() => h('div', { class: 'ktile skeleton' })))
+      : list.length
+        ? h('div', { class: 'ktiles' }, list.map((p, i) => {
+            const el = h('button', { class: 'ktile', style: { '--c': p.colour, animationDelay: `${i * 60}ms` }, onClick: () => tap(p, el) }, h('span', { class: 'kemoji' }, p.emoji), h('span', { class: 'kname' }, p.name));
+            return el;
+          }))
+        : h('div', { class: 'kmsg' }, h('p', {}, 'No buttons yet. Hold the corner to go back and add some.')),
+    now,
+    msg,
+  );
+}
+
+function renderNow(host, p) {
+  if (!p.track) {
+    host.replaceChildren();
+    return;
+  }
+  host.replaceChildren(
+    h(
+      'div',
+      { class: 'know-inner' },
+      h('div', { class: 'cover', style: p.track.image ? { backgroundImage: `url("${p.track.image}")` } : null }),
+      h('div', { class: 'know-t' }, h('div', { class: 'name' }, p.track.name), h('div', { class: 'by' }, p.track.artists)),
+      h('button', { class: 'kbtn', 'aria-label': p.playing ? 'Pause' : 'Play', onClick: async () => { await api(`/api/player/${p.playing ? 'pause' : 'resume'}`, { method: 'POST' }).catch((e) => toast(e.message, { error: true })); p.playing = !p.playing; renderNow(host, p); } }, p.playing ? icon('pause') : icon('play')),
+      h('button', { class: 'kbtn', 'aria-label': 'Next song', onClick: async () => { await api('/api/player/next', { method: 'POST' }).catch((e) => toast(e.message, { error: true })); setTimeout(async () => renderNow(host, await api('/api/player')), 700); } }, icon('next')),
+    ),
+  );
+}
+
+function icon(name) {
+  const paths = {
+    play: 'M8 5.5v13a1 1 0 0 0 1.5.86l10.6-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5z',
+    pause: 'M7 5h3.5v14H7zM13.5 5H17v14h-3.5z',
+    next: 'M5 5.6v12.8a1 1 0 0 0 1.53.85L15 13.6V18a1 1 0 0 0 2 0V6a1 1 0 0 0-2 0v4.4L6.53 4.75A1 1 0 0 0 5 5.6z',
+  };
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', paths[name]);
+  path.setAttribute('fill', 'currentColor');
+  svg.append(path);
+  return svg;
+}
+
+// A grown-up gate: press and hold for 2 seconds.
+function holdToExit() {
+  const HOLD = 2000;
+  let raf = null;
+  let start = 0;
+  const ring = h('span', { class: 'hold-ring' });
+  const btn = h('button', { class: 'hold', 'aria-label': 'Grown-ups: press and hold to leave Kids mode' }, ring, h('span', { class: 'hold-label' }, 'Hold'));
+  const stop = () => {
+    cancelAnimationFrame(raf);
+    btn.style.setProperty('--p', 0);
+    btn.classList.remove('holding');
+  };
+  const tick = () => {
+    const p = Math.min(1, (performance.now() - start) / HOLD);
+    btn.style.setProperty('--p', p);
+    if (p >= 1) {
+      stop();
+      setKidsDevice(false);
+      location.hash = '#/kids';
+      return;
+    }
+    raf = requestAnimationFrame(tick);
+  };
+  btn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    start = performance.now();
+    btn.classList.add('holding');
+    raf = requestAnimationFrame(tick);
+  });
+  for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) btn.addEventListener(ev, stop);
+  btn.addEventListener('contextmenu', (e) => e.preventDefault());
+  return btn;
 }
 
 // ------------------------------------------------------------------- boot --
