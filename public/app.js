@@ -178,6 +178,7 @@ const state = {
   order: null, // current displayed order (track objects)
   dealt: null, // { stats, plain, was }
   busy: false,
+  freshDeal: true,
   taste: null,
   brief: { text: '', length: 25, fam: 0.5, running: false, steps: [], result: null, saved: null },
 };
@@ -194,7 +195,10 @@ function route() {
     return;
   }
   const nextSel = state.tab === 'deal' && id ? decodeURIComponent(id) : null;
-  if (state.tab === 'plays') state.history = null;
+  if (state.tab === 'plays') {
+    state.history = null;
+    state.playsSub = ['rediscover', 'together', 'wrapped'].includes(id) ? id : 'stats';
+  }
   if (nextSel !== state.selected) {
     state.selected = nextSel;
     state.detail = null;
@@ -388,6 +392,7 @@ async function loadDetail(id) {
     if (state.selected !== id) return;
     state.detail = d;
     state.order = d.tracks;
+    state.tiredOf = new Map(d.tracks.map((t, i) => [t, d.tired?.[i] ?? 0]));
   } catch (err) {
     toast(err.message, { error: true });
     if (state.selected === id) location.hash = '#/deal';
@@ -411,7 +416,7 @@ function crate() {
     const q = state.filter.toLowerCase();
     const items = state.playlists.filter((p) => !q || p.name.toLowerCase().includes(q));
     if (!q || 'liked songs'.includes(q)) {
-      list.append(plRow({ id: 'liked', name: 'Liked Songs', total: state.liked?.total, canEdit: true, ownerName: 'Writes to “Liked Songs, dealt”' }, 0, true));
+      list.append(plRow({ id: 'liked', name: 'Liked Songs', total: state.liked?.total, auto: state.liked?.auto, canEdit: true, ownerName: 'Writes to “Liked Songs, dealt”' }, 0, true));
     }
     items.forEach((p, i) => list.append(plRow(p, i + 1)));
   };
@@ -452,7 +457,7 @@ function plRow(p, i, liked = false) {
     },
     liked ? h('div', { class: 'cover liked' }, '♥') : h('div', { class: `cover${p.image ? '' : ' blank'}`, style: p.image ? { backgroundImage: `url("${p.image}")` } : null }),
     h('div', { style: { minWidth: 0 } }, h('div', { class: 'name' }, p.name), h('div', { class: 'sub' }, liked ? p.ownerName : p.canEdit ? (p.collaborative ? 'Collaborative' : 'Yours') : `by ${p.ownerName}`)),
-    h('span', { class: 'count' }, p.total ?? ''),
+    h('span', { class: 'count' }, p.auto ? h('span', { class: 'auto-badge', title: p.auto === 'daily' ? 'Auto-dealt every morning' : 'Auto-dealt every Monday' }, '↻') : null, p.total ?? ''),
   );
 }
 
@@ -501,7 +506,14 @@ function stage() {
         : null,
       statsRow(st, state.dealt?.was),
       state.dealt
-        ? h('p', { class: 'compare' }, 'A plain random shuffle of this playlist typically scores ', h('b', {}, `${state.dealt.plain.spread}`), ' on spread with ', h('b', {}, plural(state.dealt.plain.backToBack, 'back-to-back')), '.')
+        ? h(
+            'p',
+            { class: 'compare' },
+            'A plain random shuffle of this playlist typically scores ', h('b', {}, `${state.dealt.plain.spread}`), ' on spread with ', h('b', {}, plural(state.dealt.plain.backToBack, 'back-to-back')), '.',
+            state.dealt.stats.freshStart != null
+              ? [' The opening quarter is ', h('b', {}, `${state.dealt.stats.freshStart}%`), ' songs you haven’t played lately (a plain shuffle: ', `${state.dealt.plain.freshStart}%`, ').']
+              : null,
+          )
         : null,
       d.hasLocal ? h('div', { class: 'callout' }, 'This playlist has local files. Spotify doesn’t let apps write those back, so you can only save the dealt order as a new playlist (without them).') : null,
       p.id === 'liked' ? h('div', { class: 'callout' }, 'Liked Songs can’t be reordered by apps, so the dealt order is written to a playlist called “Liked Songs, dealt”, reused each time.') : null,
@@ -541,7 +553,54 @@ function actions() {
   }
   wrap.append(h('span', { class: 'spacer' }));
   if (d.canRestore && p.id !== 'liked') wrap.append(h('button', { class: 'linkish', disabled: state.busy, onClick: restore }, 'Undo last write'));
-  return wrap;
+  return h('div', {}, wrap, dealOptions());
+}
+
+function dealOptions() {
+  const d = state.detail;
+  const p = d.playlist;
+  const sched = d.schedule;
+  const canAuto = (p.canEdit || p.id === 'liked') && !d.hasLocal;
+  const setAuto = async (every) => {
+    try {
+      const r = await api(`/api/playlists/${encodeURIComponent(p.id)}/schedule`, { method: 'PUT', body: { every, tz, fresh: state.freshDeal, name: p.name } });
+      d.schedule = r.schedule;
+      const pl = p.id === 'liked' ? state.liked : state.playlists?.find((x) => x.id === p.id);
+      if (pl) pl.auto = r.schedule?.every ?? null;
+      toast(r.schedule ? `Auto-deal on. Next: ${whenLocal(r.schedule.nextRun)}.` : 'Auto-deal off.');
+    } catch (err) {
+      toast(err.message, { error: true });
+    }
+    render();
+  };
+  return h(
+    'div',
+    { class: 'deal-opts' },
+    d.freshAvailable
+      ? h('label', { class: 'check', title: 'Uses your play log' }, h('input', { type: 'checkbox', checked: state.freshDeal, onChange: (e) => (state.freshDeal = e.target.checked) }), h('span', {}, h('b', {}, 'Fresh deal'), ' · songs you’ve played a lot lately go later'))
+      : h('span', { class: 'muted small' }, 'Fresh deals switch on once dj has some of your play history.'),
+    canAuto
+      ? h(
+          'div',
+          { class: 'auto' },
+          h('span', { class: 'eyebrow' }, 'Auto-deal'),
+          segmented([['off', 'Off'], ['daily', 'Every morning'], ['weekly', 'Mondays']], sched?.every ?? 'off', setAuto, 'Auto-deal'),
+          sched
+            ? h('span', { class: 'muted small' }, `Next ${whenLocal(sched.nextRun)}`, sched.lastRun ? ` · last ${ago(sched.lastRun)}` : '', sched.lastError ? h('span', { class: 'err' }, ` · ${sched.lastError}`) : null)
+            : h('span', { class: 'muted small' }, 'Re-deals itself at 5am so it’s fresh when you wake up.'),
+        )
+      : null,
+  );
+}
+
+function whenLocal(t) {
+  const d = new Date(t);
+  const today = new Date();
+  const tomorrow = new Date(Date.now() + 86_400_000);
+  const time = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  if (d.toDateString() === today.toDateString()) return `today ${time}`;
+  if (d.toDateString() === tomorrow.toDateString()) return `tomorrow ${time}`;
+  return `${d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' })} ${time}`;
 }
 
 function saveAsForm(wrap) {
@@ -569,7 +628,7 @@ async function deal() {
   state.busy = true;
   const id = state.selected;
   try {
-    const r = await api(`/api/playlists/${encodeURIComponent(id)}/shuffle`, { method: 'POST' });
+    const r = await api(`/api/playlists/${encodeURIComponent(id)}/shuffle`, { method: 'POST', body: { fresh: state.freshDeal } });
     if (state.selected !== id) return;
     // Map URIs back to track objects (a playlist may contain the same URI twice).
     const pool = new Map();
@@ -641,7 +700,7 @@ function trackList(tracks, of) {
           { class: `row${t.local ? ' local' : ''}` },
           h('span', { class: 'idx' }, i + 1),
           h('div', { class: `cover art${t.image ? '' : ' blank'}`, style: t.image ? { backgroundImage: `url("${t.image}")` } : null }),
-          h('div', { class: 't' }, h('div', { class: 'name' }, t.name), h('div', { class: 'by' }, c ? h('span', { class: 'dot', style: { background: c } }) : null, artistNames(t))),
+          h('div', { class: 't' }, h('div', { class: 'name' }, t.name, (state.tiredOf?.get(t) ?? 0) >= 0.5 ? h('span', { class: 'tag known', title: 'You’ve played this a lot lately' }, 'on repeat') : null), h('div', { class: 'by' }, c ? h('span', { class: 'dot', style: { background: c } }) : null, artistNames(t))),
           h('div', { class: 'alb' }, t.album.name),
           h('span', { class: 'dur' }, fmtDur(t.durationMs)),
         );
@@ -720,7 +779,6 @@ function briefView() {
   });
   ta.value = b.text;
 
-  const lenOut = h('output', {}, b.length);
   const famOut = h('output', {}, famLabel(b.fam));
 
   const form = h(
@@ -730,7 +788,7 @@ function briefView() {
     h(
       'div',
       { class: 'prompt-foot' },
-      h('label', { class: 'knob' }, h('span', { class: 'lbl' }, h('span', { class: 'eyebrow' }, 'Length'), lenOut), h('input', { type: 'range', min: 10, max: 60, step: 1, value: b.length, disabled: b.running, onInput: (e) => { b.length = +e.target.value; lenOut.textContent = b.length; } })),
+      lengthKnob(b, { songs: [10, 60], label: 'Length' }),
       h('label', { class: 'knob' }, h('span', { class: 'lbl' }, h('span', { class: 'eyebrow' }, 'Familiar ↔ New'), famOut), h('input', { type: 'range', min: 0, max: 1, step: 0.05, value: 1 - b.fam, disabled: b.running, onInput: (e) => { b.fam = 1 - +e.target.value; famOut.textContent = famLabel(b.fam); } })),
       h('span', { class: 'spacer' }),
       h('button', { class: 'btn accent', disabled: b.running || !state.session.ai, onClick: runBrief }, b.running ? 'Working…' : 'Brief the curator', h('span', { class: 'kbd' }, '⌘↵')),
@@ -797,7 +855,35 @@ function progressView(steps) {
   );
 }
 
-const runBrief = () => streamBrief(state.brief, '/api/brief', () => ({ brief: state.brief.text, length: state.brief.length, familiarity: state.brief.fam }));
+const runBrief = () => streamBrief(state.brief, '/api/brief', () => ({ brief: state.brief.text, length: state.brief.length, familiarity: state.brief.fam, minutes: state.brief.byTime ? state.brief.minutes : null }));
+
+const fmtMins = (m) => (m >= 60 ? `${Math.floor(m / 60)} h${m % 60 ? ` ${m % 60} min` : ''}` : `${m} min`);
+
+/** Length as a number of songs, or as a running time ("make it last 2 h 15"). */
+function lengthKnob(b, { songs: [lo, hi], label }) {
+  b.minutes ??= 45;
+  const out = h('output', {}, b.byTime ? fmtMins(b.minutes) : `${b.length} songs`);
+  const slider = h('input', {
+    type: 'range',
+    min: b.byTime ? 15 : lo,
+    max: b.byTime ? 240 : hi,
+    step: b.byTime ? 5 : 1,
+    value: b.byTime ? b.minutes : b.length,
+    disabled: b.running,
+    'aria-label': label,
+    onInput: (e) => {
+      if (b.byTime) b.minutes = +e.target.value;
+      else b.length = +e.target.value;
+      out.textContent = b.byTime ? fmtMins(b.minutes) : `${b.length} songs`;
+    },
+  });
+  return h(
+    'div',
+    { class: 'knob' },
+    h('span', { class: 'lbl' }, h('span', { class: 'mini-seg' }, ...[['songs', 'Songs'], ['time', 'Time']].map(([v, l]) => h('button', { type: 'button', 'aria-pressed': String((v === 'time') === !!b.byTime), disabled: b.running, onClick: () => { b.byTime = v === 'time'; render(); } }, l))), out),
+    slider,
+  );
+}
 
 /** Run a brief against an NDJSON endpoint, updating `b.steps` / `b.result`. */
 async function streamBrief(b, url, makeBody) {
@@ -917,6 +1003,7 @@ function resultView(b) {
     title,
     h('p', { class: 'result-desc' }, r.description),
     r.tempoTarget ? h('span', { class: 'pill' }, h('b', {}, 'Tempo'), r.tempoTarget) : null,
+    r.targetMinutes ? h('span', { class: 'pill', style: { marginLeft: '8px' } }, h('b', {}, 'Time'), `${fmtHours(r.tracks.reduce((x, t) => x + t.durationMs, 0))} (asked for ${fmtMins(r.targetMinutes)})`) : null,
     h('div', { style: { marginTop: '22px' } }, list),
     r.missing?.length
       ? h('details', { class: 'missing' }, h('summary', {}, `${plural(r.missing.length, 'pick')} couldn’t be found on Spotify and ${r.missing.length === 1 ? 'was' : 'were'} swapped for alternates`), h('ul', {}, r.missing.map((m) => h('li', {}, m))))
@@ -966,6 +1053,20 @@ function segmented(options, value, onPick, label) {
 }
 
 function playsView() {
+  const sub = state.playsSub ?? 'stats';
+  const others = state.session.others ?? [];
+  const nav = h(
+    'nav',
+    { class: 'subnav', 'aria-label': 'Plays sections' },
+    [['stats', 'Stats'], ['rediscover', 'Rediscover'], ...(others.length ? [['together', 'Together']] : []), ['wrapped', 'Wrapped']].map(([id, label]) =>
+      h('a', { href: id === 'stats' ? '#/plays' : `#/plays/${id}`, 'aria-current': String(sub === id) }, label),
+    ),
+  );
+  const body = { rediscover: rediscoverView, together: togetherView, wrapped: wrappedView }[sub]?.() ?? statsView();
+  return h('main', { class: 'plays' }, nav, body);
+}
+
+function statsView() {
   if (!state.history) loadHistory();
   const H = state.history;
   const set = (k) => (v) => {
@@ -976,9 +1077,8 @@ function playsView() {
   const others = state.session.others ?? [];
 
   return h(
-    'main',
-    { class: 'plays' },
-    h('div', { class: 'eyebrow' }, 'Plays'),
+    'div',
+    {},
     h('h1', { class: 'page-title' }, state.plays.audience === 'kids' ? 'What the kids ' : 'What you’ve been ', h('em', {}, 'playing.')),
     h(
       'div',
@@ -1253,6 +1353,196 @@ async function importFiles(files) {
   setTimeout(render, 1200);
 }
 
+
+// ------------------------------------------------------------- rediscover --
+
+state.rediscover = null;
+async function loadRediscover() {
+  try {
+    state.rediscover = await api('/api/rediscover');
+  } catch (err) {
+    toast(err.message, { error: true });
+    state.rediscover = { sets: [] };
+  }
+  if (state.tab === 'plays') render();
+}
+
+function collage(tracks) {
+  const imgs = tracks.map((t) => t.image).filter(Boolean).slice(0, 4);
+  return h('div', { class: `collage n${imgs.length}` }, imgs.length ? imgs.map((src) => h('span', { style: { backgroundImage: `url("${src}")` } })) : h('span', { class: 'blank' }));
+}
+
+async function saveSet(btn, url, okText) {
+  btn.disabled = true;
+  try {
+    const r = await api(url, { method: 'POST', body: {} });
+    toast(r.updated ? 'Refreshed with a new deal.' : okText, { link: { href: r.url, label: 'Open in Spotify' } });
+    return r;
+  } catch (err) {
+    toast(err.message, { error: true });
+    return null;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function rediscoverView() {
+  if (!state.rediscover) loadRediscover();
+  const R = state.rediscover;
+  return h(
+    'div',
+    {},
+    h('h1', { class: 'page-title' }, 'Rediscover ', h('em', {}, 'yourself.')),
+    h('p', { class: 'lead-muted' }, 'Playlists built from your own past, not from an algorithm’s guess. Each one is dealt, so the same artist never plays twice in a row. Making one again refreshes the same playlist.'),
+    !R
+      ? h('div', { class: 'skeleton', style: { height: '260px' } })
+      : h(
+          'div',
+          { class: 'sets' },
+          R.sets.map((set, i) => {
+            const locked = set.needs || set.tracks.length < 2;
+            const btn = h('button', { class: `btn ${set.made ? 'ghost' : 'accent'} small`, disabled: !!locked }, set.made ? 'Refresh playlist' : 'Make it a playlist');
+            btn.addEventListener('click', async () => {
+              if (await saveSet(btn, `/api/rediscover/${set.id}/save`, `“${set.title}” is in your Spotify.`)) {
+                set.made = true;
+                btn.textContent = 'Refresh playlist';
+                btn.className = 'btn ghost small';
+              }
+            });
+            return h(
+              'article',
+              { class: `set panel${locked ? ' locked' : ''}`, style: { animationDelay: `${i * 50}ms` } },
+              collage(set.tracks),
+              h('div', { class: 'set-body' }, h('h2', { class: 'serif' }, set.title), h('p', { class: 'muted' }, set.blurb)),
+              locked
+                ? h('p', { class: 'set-need' }, set.needs ?? 'Not enough songs yet.')
+                : h('ol', { class: 'set-list' }, set.tracks.slice(0, 5).map((t) => h('li', {}, h('span', { class: 'name' }, t.name), h('span', { class: 'by' }, ` · ${t.artist}`), h('span', { class: 'mono muted note' }, t.note)))),
+              h('div', { class: 'set-foot' }, h('span', { class: 'mono muted' }, locked ? '' : plural(set.tracks.length, 'song')), btn),
+            );
+          }),
+        ),
+  );
+}
+
+// --------------------------------------------------------------- together --
+
+state.together = null;
+state.togetherSize = 50;
+async function loadTogether() {
+  try {
+    state.together = await api(`/api/blend?size=${state.togetherSize}`);
+    // Preview in a dealt order, like the playlist it'll make.
+    if (state.together.tracks) state.together.tracks = properShuffle(state.together.tracks.map((t) => ({ ...t, album: { id: null, name: t.album ?? '' } })));
+  } catch (err) {
+    toast(err.message, { error: true });
+    state.together = { partner: null };
+  }
+  if (state.tab === 'plays') render();
+}
+
+function togetherView() {
+  if (!state.together) loadTogether();
+  const T = state.together;
+  const me = state.session.user;
+  if (T && !T.partner) return h('div', {}, h('h1', { class: 'page-title' }, 'Together'), h('p', { class: 'muted' }, 'Once the second person has connected their Spotify, a playlist for both of you appears here.'));
+  const first = (n) => (n || '').split(' ')[0];
+  const btn = h('button', { class: `btn ${T?.made ? 'ghost' : 'accent'}`, disabled: !T?.tracks?.length }, T?.made ? 'Refresh our playlist' : 'Make our playlist');
+  btn.addEventListener('click', async () => {
+    if (await saveSet(btn, '/api/blend/save', 'Saved to your Spotify. Share it with a tap from Spotify.')) {
+      T.made = true;
+      btn.textContent = 'Refresh our playlist';
+    }
+  });
+  const colours = { both: 'var(--ink)', a: PALETTE[0], b: PALETTE[1] };
+  return h(
+    'div',
+    {},
+    h('h1', { class: 'page-title' }, first(me.name), ' ', h('em', {}, '+'), ' ', first(T?.partner?.name ?? '…')),
+    h('p', { class: 'lead-muted' }, 'One playlist that’s genuinely both of you: songs you both play first, then each person’s favourites in equal measure, weighted towards what you’ve played lately. Dealt, so no artist plays twice in a row.'),
+    !T
+      ? h('div', { class: 'skeleton', style: { height: '260px' } })
+      : !T.tracks.length
+        ? h('p', { class: 'muted' }, 'You both need some play history first. Give it a day or import your Spotify data.')
+        : [
+            h(
+              'div',
+              { class: 'panel balance' },
+              h('div', { class: 'balance-bar', role: 'img', 'aria-label': `${T.counts.both} shared, ${T.counts.a} ${first(me.name)}, ${T.counts.b} ${first(T.partner.name)}` }, [['both', T.counts.both], ['a', T.counts.a], ['b', T.counts.b]].filter(([, n]) => n).map(([k, n]) => h('span', { style: { flex: n, background: colours[k] } }))),
+              h(
+                'div',
+                { class: 'legend' },
+                h('span', {}, h('i', { style: { background: colours.both } }), `You both play · ${T.counts.both}`),
+                h('span', {}, h('i', { style: { background: colours.a } }), `${first(me.name)}’s · ${T.counts.a}`),
+                h('span', {}, h('i', { style: { background: colours.b } }), `${first(T.partner.name)}’s · ${T.counts.b}`),
+              ),
+              h('div', { class: 'actions' }, segmented([['30', '30 songs'], ['50', '50'], ['80', '80']], String(state.togetherSize), (v) => { state.togetherSize = Number(v); state.together = null; render(); }, 'Size'), h('span', { class: 'spacer' }), btn),
+            ),
+            h(
+              'div',
+              { class: 'tlist' },
+              T.tracks.map((t, i) => h('div', { class: 'rrow' }, h('div', { class: `cover art${t.image ? '' : ' blank'}`, style: t.image ? { backgroundImage: `url("${t.image}")` } : null }), h('div', { style: { minWidth: 0 } }, h('div', { class: 'name' }, t.name), h('div', { class: 'by' }, t.artist)), h('span', { class: 'who-tag', style: { '--c': colours[t.who] } }, t.who === 'both' ? 'both' : first(t.who === 'a' ? me.name : T.partner.name)))),
+            ),
+          ],
+  );
+}
+
+// ---------------------------------------------------------------- wrapped --
+
+state.wrapped = null;
+state.wrappedPeriod = null;
+async function loadWrapped() {
+  const q = new URLSearchParams({ tz, ...(state.wrappedPeriod ? { period: state.wrappedPeriod } : {}) });
+  try {
+    state.wrapped = await api(`/api/wrapped?${q}`);
+    state.wrappedPeriod = state.wrapped.wrapped?.period ?? null;
+  } catch (err) {
+    toast(err.message, { error: true });
+    state.wrapped = { periods: { months: [], years: [] }, wrapped: null };
+  }
+  if (state.tab === 'plays') render();
+}
+
+const hourLabel = (hr) => new Date(Date.UTC(2020, 0, 1, hr)).toLocaleTimeString(undefined, { hour: 'numeric', timeZone: 'UTC' });
+
+function wrappedView() {
+  if (!state.wrapped) loadWrapped();
+  const W = state.wrapped;
+  const w = W?.wrapped;
+  const picker = W
+    ? h(
+        'select',
+        { class: 'select', 'aria-label': 'Period', onChange: (e) => { state.wrappedPeriod = e.target.value; state.wrapped = null; render(); } },
+        W.periods.years.length ? h('optgroup', { label: 'Years' }, W.periods.years.map((y) => h('option', { value: y, selected: y === state.wrappedPeriod }, y))) : null,
+        W.periods.months.length ? h('optgroup', { label: 'Months' }, W.periods.months.map((m) => h('option', { value: m, selected: m === state.wrappedPeriod }, new Date(`${m}-15T12:00:00Z`).toLocaleDateString(undefined, { month: 'long', year: 'numeric' })))) : null,
+      )
+    : null;
+  if (W && !w) return h('div', {}, h('h1', { class: 'page-title' }, 'Wrapped'), h('p', { class: 'muted' }, 'Wrapped needs at least a few weeks of plays. Import your Spotify data to see past years straight away.'));
+  const change = w?.prevPlays ? Math.round(((w.plays - w.prevPlays) / w.prevPlays) * 100) : null;
+  const card = (cls, ...kids) => h('section', { class: `wcard ${cls}` }, ...kids);
+  return h(
+    'div',
+    {},
+    h('div', { class: 'wrapped-head' }, h('h1', { class: 'page-title' }, 'Your ', h('em', {}, w?.label ?? '…')), picker),
+    !w
+      ? h('div', { class: 'skeleton', style: { height: '420px' } })
+      : h(
+          'div',
+          { class: 'wdeck' },
+          card('c-ink', h('div', { class: 'eyebrow' }, w.label), h('div', { class: 'w-huge' }, w.minutes.toLocaleString()), h('div', { class: 'w-sub' }, 'minutes of music'), h('p', {}, `${w.plays.toLocaleString()} plays across ${w.days} days.`, change != null ? ` That’s ${change >= 0 ? `${change}% more` : `${-change}% less`} than ${w.prevLabel}.` : '')),
+          card('c-accent', h('div', { class: 'eyebrow' }, 'Your artist'), h('div', { class: 'w-big' }, w.topArtist.name), h('p', {}, `${w.topArtist.plays.toLocaleString()} plays: ${w.topArtist.share}% of everything you listened to.`)),
+          card('c-paper', h('div', { class: 'eyebrow' }, 'Top five'), h('ol', { class: 'w-list' }, w.topArtists.map((a) => h('li', {}, h('span', {}, a.name), h('span', { class: 'mono' }, a.plays))))),
+          card('c-blue', h('div', { class: 'eyebrow' }, 'Your song'), w.topTrack.image ? h('div', { class: 'w-art', style: { backgroundImage: `url("${w.topTrack.image}")` } }) : null, h('div', { class: 'w-big' }, w.topTrack.name), h('p', {}, `${w.topTrack.artist} · played ${w.topTrack.plays} times`)),
+          card('c-paper', h('div', { class: 'eyebrow' }, 'Top songs'), h('ol', { class: 'w-list' }, w.topTracks.map((t) => h('li', {}, h('span', {}, t.name, h('small', {}, t.artist)), h('span', { class: 'mono' }, t.plays))))),
+          w.newArtistCount != null
+            ? card('c-green', h('div', { class: 'eyebrow' }, 'New to you'), h('div', { class: 'w-huge' }, w.newArtistCount), h('div', { class: 'w-sub' }, `artist${w.newArtistCount === 1 ? '' : 's'} you’d never played before`), w.newArtists.length ? h('p', {}, w.newArtists.join(', ')) : null)
+            : null,
+          card('c-ink', h('div', { class: 'eyebrow' }, 'When'), h('div', { class: 'w-big' }, hourLabel(w.peakHour)), h('div', { class: 'w-sub' }, 'was your hour'), h('p', {}, `Your biggest day was ${new Date(`${w.bigDay.day}T12:00:00Z`).toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' })}, with ${w.bigDay.plays} plays.`)),
+          card('c-accent', h('div', { class: 'eyebrow' }, 'You are'), h('div', { class: 'w-big serif-italic' }, w.personality.name), h('p', {}, w.personality.line)),
+        ),
+    w ? h('p', { class: 'muted small', style: { marginTop: '14px' } }, 'Swipe through. Each card is sized for a screenshot.') : null,
+  );
+}
+
 // ------------------------------------------------------- kids: setup page --
 
 const KIDS_KEY = 'dj_kids_device';
@@ -1341,6 +1631,7 @@ function kidsTiles(list) {
           'div',
           { class: 'kctl' },
           h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: p.redeal, onChange: (e) => patchKids(p.id, { redeal: e.target.checked }) }), 'Re-deal each play'),
+          h('label', { class: 'sleepsel', title: 'Fade out and stop after this long' }, '🌙', h('select', { 'aria-label': 'Sleep timer', onChange: (e) => patchKids(p.id, { sleep: Number(e.target.value) }) }, [[0, 'No sleep timer'], [20, '20 min'], [30, '30 min'], [45, '45 min'], [60, '1 hour']].map(([v, l]) => h('option', { value: v, selected: (p.sleep ?? 0) === v }, l)))),
           h('button', { class: 'linkish', onClick: () => removeKids(p.id) }, 'Remove'),
         ),
       ),
@@ -1414,7 +1705,6 @@ function kidsMaker(b, profiles) {
   const ta = h('textarea', { placeholder: 'Songs for a long drive to Grandma’s', 'aria-label': 'What is it for?', disabled: b.running, onInput: (e) => (b.text = e.target.value) });
   ta.value = b.text;
   const tolOut = h('output', {}, tolLabel(b.tolerance));
-  const lenOut = h('output', {}, b.length);
   return h(
     'div',
     {},
@@ -1427,10 +1717,10 @@ function kidsMaker(b, profiles) {
         'div',
         { class: 'prompt-foot' },
         profiles.length > 1 ? h('div', { class: 'kidpick' }, profiles.map((k) => h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !b.kidIds.length || b.kidIds.includes(k.id), onChange: (e) => { const all = b.kidIds.length ? b.kidIds : profiles.map((p) => p.id); b.kidIds = e.target.checked ? [...new Set([...all, k.id])] : all.filter((x) => x !== k.id); } }), k.name || 'Unnamed'))) : null,
-        h('label', { class: 'knob' }, h('span', { class: 'lbl' }, h('span', { class: 'eyebrow' }, 'Length'), lenOut), h('input', { type: 'range', min: 8, max: 50, value: b.length, disabled: b.running, onInput: (e) => { b.length = +e.target.value; lenOut.textContent = b.length; } })),
+        lengthKnob(b, { songs: [8, 50], label: 'Length' }),
         h('label', { class: 'knob' }, h('span', { class: 'lbl' }, h('span', { class: 'eyebrow' }, 'Them ↔ Everyone'), tolOut), h('input', { type: 'range', min: 0, max: 1, step: 0.05, value: b.tolerance, disabled: b.running, onInput: (e) => { b.tolerance = +e.target.value; tolOut.textContent = tolLabel(b.tolerance); } })),
         h('span', { class: 'spacer' }),
-        h('button', { class: 'btn accent', disabled: b.running || !state.session.ai, onClick: () => streamBrief(b, '/api/kids/brief', () => ({ brief: b.text, length: b.length, tolerance: b.tolerance, kidIds: b.kidIds })) }, b.running ? 'Working…' : 'Make it'),
+        h('button', { class: 'btn accent', disabled: b.running || !state.session.ai, onClick: () => streamBrief(b, '/api/kids/brief', () => ({ brief: b.text, length: b.length, tolerance: b.tolerance, kidIds: b.kidIds, minutes: b.byTime ? b.minutes : null })) }, b.running ? 'Working…' : 'Make it'),
       ),
     ),
     !profiles.length ? h('p', { class: 'muted small' }, 'Tip: add the kids above first, with ages, so the picks fit them.') : null,
@@ -1474,7 +1764,7 @@ function kidsResult(b) {
       h(
         'span',
         { style: { display: 'flex', gap: '8px' } },
-        h('button', { class: 'btn ghost small', onClick: () => streamBrief(b, '/api/kids/brief', () => ({ brief: b.text, length: b.length, tolerance: b.tolerance, kidIds: b.kidIds })) }, 'Try again'),
+        h('button', { class: 'btn ghost small', onClick: () => streamBrief(b, '/api/kids/brief', () => ({ brief: b.text, length: b.length, tolerance: b.tolerance, kidIds: b.kidIds, minutes: b.byTime ? b.minutes : null })) }, 'Try again'),
         h('button', {
           class: 'btn accent small',
           disabled: !r.tracks.length,
@@ -1574,7 +1864,7 @@ function renderNow(host, p) {
       'div',
       { class: 'know-inner' },
       h('div', { class: 'cover', style: p.track.image ? { backgroundImage: `url("${p.track.image}")` } : null }),
-      h('div', { class: 'know-t' }, h('div', { class: 'name' }, p.track.name), h('div', { class: 'by' }, p.track.artists)),
+      h('div', { class: 'know-t' }, h('div', { class: 'name' }, p.track.name), h('div', { class: 'by' }, p.sleep ? h('span', { class: 'zz' }, p.sleep.fading ? '🌙 Getting sleepy…' : `🌙 ${Math.max(1, Math.round((p.sleep.endsAt - Date.now()) / 60000))} min left`) : p.track.artists)),
       h('button', { class: 'kbtn', 'aria-label': p.playing ? 'Pause' : 'Play', onClick: async () => { await api(`/api/player/${p.playing ? 'pause' : 'resume'}`, { method: 'POST' }).catch((e) => toast(e.message, { error: true })); p.playing = !p.playing; renderNow(host, p); } }, p.playing ? icon('pause') : icon('play')),
       h('button', { class: 'kbtn', 'aria-label': 'Next song', onClick: async () => { await api('/api/player/next', { method: 'POST' }).catch((e) => toast(e.message, { error: true })); setTimeout(async () => renderNow(host, await api('/api/player')), 700); } }, icon('next')),
     ),

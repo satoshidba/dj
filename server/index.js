@@ -7,7 +7,11 @@ import { authorizeUrl, exchangeCode, spotifyFor, SpotifyError, SPOTIFY_API, PLAY
 import { properShuffle, fisherYates, spreadStats } from './shuffle.js';
 import { curate, tasteProfile, aiEnabled, kidsContexts } from './curator.js';
 import * as passkeys from './passkeys.js';
-import { startTracking, pollUser, playsFor, addPlays, fromExport, summarise, overlap, POLL_MINUTES } from './plays.js';
+import { writeOrder, DealError, stalenessForUser } from './deal.js';
+import { setSchedule, startAutoDeal, runDue } from './autodeal.js';
+import { rediscover, blend, wrapped, wrappedPeriods } from './insights.js';
+import { startSleep, sleepStatus, cancelSleep } from './sleep.js';
+import { startTracking, pollUser, playsFor, addPlays, fromExport, summarise, overlap, POLL_MINUTES, freshStart } from './plays.js';
 
 for (const key of ['SPOTIFY_CLIENT_ID', 'SPOTIFY_CLIENT_SECRET', 'APP_URL']) {
   if (!process.env[key]) {
@@ -187,11 +191,12 @@ app.get(
   wrap(async (req, res) => {
     const [lists, likedTotal] = await Promise.all([req.sp.playlists(), req.sp.likedTotal().catch(() => null)]);
     const likedTarget = store.getLikedPlaylist(req.user.id);
+    const sched = store.schedulesFor(req.user.id);
     res.json({
-      liked: { total: likedTotal },
+      liked: { total: likedTotal, auto: sched.liked?.every ?? null },
       playlists: lists
         .filter((p) => p.id !== likedTarget)
-        .map((p) => ({ ...p, canEdit: p.ownerId === req.user.id || p.collaborative })),
+        .map((p) => ({ ...p, canEdit: p.ownerId === req.user.id || p.collaborative, auto: sched[p.id]?.every ?? null })),
     });
   }),
 );
@@ -206,10 +211,15 @@ app.get(
       id === 'liked'
         ? { id: 'liked', name: 'Liked Songs', total: tracks.length, canEdit: false, image: null }
         : await req.sp.playlist(id).then((p) => ({ ...p, canEdit: p.ownerId === req.user.id || p.collaborative }));
+    const staleness = stalenessForUser(req.user.id);
     res.json({
       playlist: meta,
       tracks,
-      stats: spreadStats(tracks),
+      stats: { ...spreadStats(tracks), ...(staleness ? { freshStart: freshStart(tracks, staleness) } : {}) },
+      freshAvailable: !!staleness,
+      // 0–1 per track, so the list can show which songs are on heavy rotation.
+      tired: staleness ? tracks.map((t) => Math.round(staleness(t) * 100) / 100) : null,
+      schedule: store.getSchedule(req.user.id, id),
       hasLocal: tracks.some((t) => t.local),
       canRestore: !!store.getBackup(req.user.id, id),
       likedTarget: id === 'liked' ? store.getLikedPlaylist(req.user.id) : null,
@@ -222,12 +232,15 @@ app.post(
   auth,
   wrap(async (req, res) => {
     const tracks = await loadTracks(req, req.params.id);
-    const shuffled = properShuffle(tracks);
+    const staleness = req.body?.fresh === false ? null : stalenessForUser(req.user.id);
+    const shuffled = properShuffle(tracks, { staleness: staleness ?? undefined });
+    const plain = fisherYates(tracks);
     res.json({
       order: shuffled.map((t) => t.uri),
-      stats: spreadStats(shuffled),
+      stats: { ...spreadStats(shuffled), ...(staleness ? { freshStart: freshStart(shuffled, staleness) } : {}) },
       // What a plain random shuffle would typically have done, for comparison.
-      plain: spreadStats(fisherYates(tracks)),
+      plain: { ...spreadStats(plain), ...(staleness ? { freshStart: freshStart(plain, staleness) } : {}) },
+      fresh: !!staleness,
     });
   }),
 );
@@ -246,39 +259,30 @@ app.post(
     if (!sameTracks(current.map((t) => t.uri), uris)) {
       return res.status(409).json({ error: 'The playlist changed since you opened it. Reload and deal again.' });
     }
-    if (current.some((t) => t.local)) {
-      return res.status(422).json({
-        error: 'This playlist has local files, which Spotify won’t let apps write back. Save it as a new playlist instead (local files will be left out).',
-      });
+    try {
+      const r = await writeOrder(req.user.id, req.sp, id, current, uris);
+      trackCache.delete(`${req.user.id}:${id}`);
+      res.json({ ok: true, ...r });
+    } catch (err) {
+      if (err instanceof DealError) return res.status(err.status).json({ error: err.message });
+      throw err;
     }
-
-    if (id === 'liked') {
-      // Liked Songs can't be reordered, so write into a dedicated playlist we reuse.
-      let target = store.getLikedPlaylist(req.user.id);
-      const name = 'Liked Songs, dealt';
-      const description = `Your Liked Songs, properly shuffled by dj on ${new Date().toDateString()}. Play in order.`;
-      if (target) {
-        try {
-          await req.sp.updatePlaylistDetails(target, { name, description });
-        } catch (err) {
-          if (err.status === 404 || err.status === 403) target = null;
-          else throw err;
-        }
-      }
-      if (!target) {
-        target = (await req.sp.createPlaylist({ name, description })).id;
-        store.setLikedPlaylist(req.user.id, target);
-      }
-      await req.sp.replacePlaylistItems(target, uris);
-      return res.json({ ok: true, url: `https://open.spotify.com/playlist/${target}` });
-    }
-
-    store.putBackup(req.user.id, id, current.map((t) => t.uri));
-    await req.sp.replacePlaylistItems(id, uris);
-    trackCache.delete(`${req.user.id}:${id}`);
-    res.json({ ok: true, url: `https://open.spotify.com/playlist/${id}`, canRestore: true });
   }),
 );
+
+app.put('/api/playlists/:id/schedule', auth, (req, res) => {
+  const tz = isValidTz(req.body?.tz) ? req.body.tz : 'UTC';
+  res.json({ schedule: setSchedule(req.user.id, req.params.id, { every: req.body?.every, tz, fresh: req.body?.fresh !== false, name: String(req.body?.name ?? '').slice(0, 100) }) });
+});
+
+app.get('/api/schedules', auth, (req, res) => res.json({ schedules: store.schedulesFor(req.user.id) }));
+
+// Lets the test suite (and an impatient human) trigger due auto-deals now.
+app.post('/api/schedules/run-due', auth, wrap(async (req, res) => {
+  const later = process.env.DJ_TEST === '1' && req.body?.pretendLater;
+  await runDue(Date.now() + (later ? 9 * 86_400_000 : 0));
+  res.json({ schedules: store.schedulesFor(req.user.id) });
+}));
 
 app.post(
   '/api/playlists/:id/restore',
@@ -335,7 +339,7 @@ app.post('/api/brief', auth, async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   const send = (obj) => res.write(`${JSON.stringify(obj)}\n`);
   try {
-    const result = await curate({ userId: req.user.id, sp: req.sp, brief, length, familiarity }, send);
+    const result = await curate({ userId: req.user.id, sp: req.sp, brief, length, familiarity, minutes: minutesFrom(req) }, send);
     send({ stage: 'done', result });
   } catch (err) {
     console.error('brief failed:', err);
@@ -344,6 +348,97 @@ app.post('/api/brief', auth, async (req, res) => {
   res.end();
 });
 
+
+
+// ------------------------------------------- rediscover, blend, wrapped ----
+
+/** A person's own plays, with Kids mode plays left out. */
+function grownRows(userId) {
+  const kidsCtx = kidsContexts(userId);
+  return playsFor(userId).filter((r) => !(r.ctx && kidsCtx.has(r.ctx)));
+}
+
+const asTrack = (t) => ({ uri: t.uri, name: t.name, artists: t.artists ?? [{ id: null, name: t.artist }], album: { id: null, name: t.album ?? '' } });
+
+/** Create (or refresh, if we made it before) a playlist with a dealt order. */
+async function saveDealt(req, { key, name, description, tracks }) {
+  const order = properShuffle(tracks.map(asTrack)).map((t) => t.uri);
+  const made = store.getMade(req.user.id, key);
+  let id = made;
+  if (id) {
+    try {
+      await req.sp.updatePlaylistDetails(id, { name, description });
+    } catch (err) {
+      if (err.status === 404 || err.status === 403) id = null;
+      else throw err;
+    }
+  }
+  if (!id) {
+    id = (await req.sp.createPlaylist({ name, description })).id;
+    store.setMade(req.user.id, key, id);
+  }
+  await req.sp.replacePlaylistItems(id, order);
+  return { url: `https://open.spotify.com/playlist/${id}`, updated: !!made && made === id };
+}
+
+app.get('/api/rediscover', auth, (req, res) => {
+  const rows = grownRows(req.user.id);
+  res.json({ since: rows[0]?.at ?? null, sets: rediscover(rows).map((s) => ({ ...s, made: !!store.getMade(req.user.id, `rediscover:${s.id}`) })) });
+});
+
+app.post(
+  '/api/rediscover/:set/save',
+  auth,
+  wrap(async (req, res) => {
+    const set = rediscover(grownRows(req.user.id)).find((s) => s.id === req.params.set);
+    if (!set || set.tracks.length < 2) return res.status(404).json({ error: 'Not enough songs for that one yet.' });
+    res.json(await saveDealt(req, { key: `rediscover:${set.id}`, name: set.title, description: `${set.blurb} Made by dj from your play history.`, tracks: set.tracks }));
+  }),
+);
+
+function blendFor(req) {
+  const partner = store.allUsers().find((u) => u.id !== req.user.id);
+  if (!partner) return null;
+  const size = Math.min(100, Math.max(20, Number(req.query.size || req.body?.size) || 50));
+  return { partner, ...blend(grownRows(req.user.id), grownRows(partner.id), { size }) };
+}
+
+app.get('/api/blend', auth, (req, res) => {
+  const b = blendFor(req);
+  if (!b) return res.json({ partner: null });
+  const key = `blend:${[req.user.id, b.partner.id].sort().join('+')}`;
+  res.json({ partner: { id: b.partner.id, name: b.partner.name, image: b.partner.image }, tracks: b.tracks, counts: b.counts, shared: b.shared, made: !!store.getMade(req.user.id, key) });
+});
+
+app.post(
+  '/api/blend/save',
+  auth,
+  wrap(async (req, res) => {
+    const b = blendFor(req);
+    if (!b || b.tracks.length < 2) return res.status(400).json({ error: 'Both of you need some play history first.' });
+    const names = [req.user.name, b.partner.name].map((n) => n.split(' ')[0]);
+    const key = `blend:${[req.user.id, b.partner.id].sort().join('+')}`;
+    res.json(await saveDealt(req, { key, name: `${names[0]} + ${names[1]}`, description: `Both of you, evenly: songs you both play, then each person’s favourites. Made by dj from your play histories.`, tracks: b.tracks }));
+  }),
+);
+
+app.get('/api/wrapped', auth, (req, res) => {
+  const tz = isValidTz(req.query.tz) ? req.query.tz : 'UTC';
+  const rows = grownRows(req.user.id);
+  const periods = wrappedPeriods(rows, tz);
+  const period = /^\d{4}(-\d{2})?$/.test(req.query.period ?? '') ? req.query.period : periods.months[1] ?? periods.months[0] ?? periods.years[0];
+  if (!period) return res.json({ periods, wrapped: null });
+  const w = wrapped(rows, period, tz);
+  // Compare with the period before.
+  let prev = null;
+  if (period.length === 4) prev = String(Number(period) - 1);
+  else {
+    const [y, m] = period.split('-').map(Number);
+    prev = m === 1 ? `${y - 1}-12` : `${y}-${String(m - 1).padStart(2, '0')}`;
+  }
+  const pw = wrapped(rows, prev, tz);
+  res.json({ periods, wrapped: w && { ...w, prevPlays: pw?.plays ?? null, prevLabel: pw?.label ?? null } });
+});
 
 // -------------------------------------------------------------- history ----
 
@@ -380,6 +475,12 @@ app.get('/api/history', auth, (req, res) => {
   }
   res.json({ ...base, who: 'me', summary: summarise(mine, { ...opts, kidsCtx: kidsContexts(me.id) }) });
 });
+
+/** Optional "make it last N minutes" (10 min to 5 hours). */
+function minutesFrom(req) {
+  const m = Number(req.body?.minutes);
+  return Number.isFinite(m) && m >= 10 ? Math.min(300, Math.round(m)) : null;
+}
 
 function isValidTz(tz) {
   if (typeof tz !== 'string' || !tz) return false;
@@ -476,6 +577,7 @@ app.patch('/api/kids/playlists/:id', auth, (req, res) => {
           ...(req.body.emoji ? { emoji: String(req.body.emoji).slice(0, 8) } : {}),
           ...(req.body.colour && KID_COLOURS.includes(req.body.colour) ? { colour: req.body.colour } : {}),
           ...(typeof req.body.redeal === 'boolean' ? { redeal: req.body.redeal } : {}),
+          ...([0, 20, 30, 45, 60].includes(req.body.sleep) ? { sleep: req.body.sleep } : {}),
         }
       : p,
   );
@@ -502,7 +604,7 @@ app.post('/api/kids/brief', auth, async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   const send = (obj) => res.write(`${JSON.stringify(obj)}\n`);
   try {
-    const result = await curate({ userId: req.user.id, sp: req.sp, brief, length, familiarity: 0.5, kids: { profiles, tolerance } }, send);
+    const result = await curate({ userId: req.user.id, sp: req.sp, brief, length, familiarity: 0.5, kids: { profiles, tolerance }, minutes: minutesFrom(req) }, send);
     send({ stage: 'done', result });
   } catch (err) {
     console.error('kids brief failed:', err);
@@ -535,7 +637,8 @@ app.post(
     }
     await req.sp.setShuffle(false, device.id).catch(() => {});
     await req.sp.play(`spotify:playlist:${entry.id}`, device.id);
-    res.json({ ok: true, device: device.name });
+    const sleep = entry.sleep ? startSleep(req.user.id, req.sp, { contextUri: `spotify:playlist:${entry.id}`, minutes: entry.sleep, deviceId: device.id }) : (cancelSleep(req.user.id), null);
+    res.json({ ok: true, device: device.name, sleep });
   }),
 );
 
@@ -550,6 +653,7 @@ app.get(
       device: st?.device?.name ?? null,
       context: st?.context?.uri ?? null,
       track: t ? { name: t.name, artists: (t.artists ?? []).map((a) => a.name).join(', '), image: t.album?.images?.[0]?.url ?? null } : null,
+      sleep: sleepStatus(req.user.id),
     });
   }),
 );
@@ -594,4 +698,5 @@ app.use((err, req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`dj listening on :${PORT} (${APP_URL})`);
   startTracking();
+  startAutoDeal();
 });

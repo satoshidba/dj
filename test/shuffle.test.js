@@ -107,3 +107,42 @@ test('scales to a 10k-track playlist quickly', () => {
   assert.equal(spreadStats(out).backToBack, 0);
   assert.ok(ms < 5000, `${ms}ms`);
 });
+
+test('fresh deal moves heavily played tracks later without breaking spacing', () => {
+  const tracks = make({ a: 10, b: 9, c: 8, d: 7, e: 6, f: 6, g: 5, h: 5, i: 4, j: 4, k: 3, l: 3, m: 2, n: 2, o: 1, p: 1 });
+  const tired = new Set(tracks.filter((_, i) => i % 4 === 0).map((t) => t.uri)); // a quarter are "hammered"
+  const staleness = (t) => (tired.has(t.uri) ? 0.9 : 0);
+  let firstQuarterTired = 0, plainFirstQuarterTired = 0;
+  for (let s = 0; s < 10; s++) {
+    const out = properShuffle(tracks, { rng: seededRandom(s), staleness });
+    assert.equal(spreadStats(out).backToBack, 0, `seed ${s}`);
+    sameMultiset(out, tracks);
+    firstQuarterTired += out.slice(0, out.length / 4).filter((t) => tired.has(t.uri)).length;
+    plainFirstQuarterTired += properShuffle(tracks, { rng: seededRandom(s) }).slice(0, out.length / 4).filter((t) => tired.has(t.uri)).length;
+  }
+  assert.ok(firstQuarterTired < plainFirstQuarterTired * 0.4, `fresh ${firstQuarterTired} vs plain ${plainFirstQuarterTired}`);
+});
+
+test('fresh deals still differ each time', () => {
+  const tracks = make({ a: 6, b: 6, c: 6, d: 6, e: 6 });
+  const staleness = (t) => (Number(t.uri.split(':').pop()) % 3 === 0 ? 0.8 : 0);
+  const a = properShuffle(tracks, { rng: seededRandom(1), staleness }).map((t) => t.uri).join();
+  const b = properShuffle(tracks, { rng: seededRandom(2), staleness }).map((t) => t.uri).join();
+  assert.notEqual(a, b);
+});
+
+test('fitToDuration lands within a minute and keeps the ends', async () => {
+  process.env.DATA_DIR ??= (await import('node:fs')).mkdtempSync((await import('node:path')).join((await import('node:os')).tmpdir(), 'dj-fit-'));
+  const { fitToDuration } = await import('../server/curator.js');
+  const rng = seededRandom(4);
+  const mk = (n, p) => Array.from({ length: n }, (_, i) => ({ uri: `${p}${i}`, durationMs: 150_000 + Math.floor(rng() * 150_000) }));
+  for (const target of [20, 45, 63, 135]) {
+    const tracks = mk(Math.round(target / 3.6), 't');
+    const pool = mk(20, 'p');
+    const out = fitToDuration(tracks, pool, target * 60_000);
+    const total = out.reduce((s, t) => s + t.durationMs, 0);
+    assert.ok(Math.abs(total - target * 60_000) <= 60_000, `${target} min → ${(total / 60000).toFixed(1)}`);
+    assert.equal(out[0], tracks[0]);
+    assert.equal(out.at(-1), tracks.at(-1));
+  }
+});

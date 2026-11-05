@@ -217,3 +217,39 @@ export function overlap(a, b, limit = 12) {
   }
   return out.sort((x, y) => y.score - x.score).slice(0, limit);
 }
+
+// ---------------------------------------------------------------- staleness --
+
+const nameKey = (name, artist) => `${String(name).trim().toLowerCase()}|${String(artist ?? '').trim().toLowerCase()}`;
+
+/**
+ * How "tired" each song is right now, from 0 (not played lately) to ~1 (on
+ * heavy rotation). Each play in the last 60 days counts, fading with a 10-day
+ * half-life-ish curve: one play yesterday ≈ 0.37, five this week ≈ 0.85.
+ * Kids-mode plays don't count against the grown-ups' songs.
+ */
+export function stalenessFor(rows, { kidsCtx = new Set(), now = Date.now() } = {}) {
+  const score = new Map();
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const r = rows[i];
+    const age = (now - r.at) / 86_400_000;
+    if (age > 60) break;
+    if (r.ctx && kidsCtx.has(r.ctx)) continue;
+    const v = Math.exp(-Math.max(0, age) / 10);
+    if (r.uri) score.set(r.uri, (score.get(r.uri) ?? 0) + v);
+    const nk = nameKey(r.name, r.artists[0]?.name);
+    score.set(nk, (score.get(nk) ?? 0) + v);
+  }
+  const fn = (t) => {
+    const v = score.get(t.uri) ?? score.get(nameKey(t.name, t.artists?.[0]?.name)) ?? 0;
+    return 1 - Math.exp(-v / 2);
+  };
+  fn.known = score.size > 0;
+  return fn;
+}
+
+/** Share (0–100) of the opening quarter that hasn't been played lately. */
+export function freshStart(order, staleness) {
+  const head = order.slice(0, Math.max(1, Math.ceil(order.length / 4)));
+  return Math.round((head.filter((t) => staleness(t) < 0.15).length / head.length) * 100);
+}

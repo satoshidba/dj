@@ -8,7 +8,7 @@ const FILE = path.join(DATA_DIR, 'store.json');
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
-let state = { users: {}, sessions: {}, backups: {}, likedPlaylist: {}, kids: [], kidsPlaylists: {} };
+let state = { users: {}, sessions: {}, backups: {}, likedPlaylist: {}, kids: [], kidsPlaylists: {}, schedules: {}, made: {} };
 try {
   state = { ...state, ...JSON.parse(fs.readFileSync(FILE, 'utf8')) };
 } catch (err) {
@@ -65,6 +65,25 @@ export const store = {
     state.kids = kids;
     save();
   },
+  // Auto-deal: { [userId]: { [playlistId]: { every, tz, fresh, name, nextRun, lastRun, lastError } } }
+  getSchedule: (userId, playlistId) => state.schedules[userId]?.[playlistId] ?? null,
+  schedulesFor: (userId) => state.schedules[userId] ?? {},
+  allSchedules: () => Object.entries(state.schedules).flatMap(([userId, m]) => Object.entries(m).map(([playlistId, s]) => ({ userId, playlistId, ...s }))),
+  setSchedule(userId, playlistId, sched) {
+    state.schedules[userId] ??= {};
+    if (sched) state.schedules[userId][playlistId] = sched;
+    else delete state.schedules[userId][playlistId];
+    save();
+  },
+
+  // Playlists dj generated and refreshes in place (rediscover sets, the blend).
+  getMade: (userId, key) => state.made[userId]?.[key] ?? null,
+  setMade(userId, key, playlistId) {
+    state.made[userId] ??= {};
+    state.made[userId][key] = playlistId;
+    save();
+  },
+
   kidsPlaylists: (userId) => state.kidsPlaylists[userId] ?? [],
   setKidsPlaylists(userId, list) {
     state.kidsPlaylists[userId] = list;

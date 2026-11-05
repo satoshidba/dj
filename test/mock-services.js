@@ -70,7 +70,8 @@ const byUri = new Map(ALL.map((t) => [t.uri, t]));
 let created = 0;
 
 export const mockState = { playlists };
-const player = { is_playing: false, device: { name: 'Car (iPhone)' }, item: null, context: null };
+const player = { is_playing: false, device: { id: 'car', name: 'Car (iPhone)', volume_percent: 80, supports_volume: true }, item: null, context: null };
+export const volumeLog = [];
 // 40 plays over the last few hours, some from the Gym Rock playlist.
 const recent = ALL.slice(0, 40).map((t, i) => ({ track: t, played_at: new Date(Date.now() - (40 - i) * 4 * 60_000).toISOString(), context: i % 3 ? { uri: 'spotify:playlist:gym' } : null })).reverse();
 const recentSam = ALL.slice(15, 45).map((t, i) => ({ track: t, played_at: new Date(Date.now() - (30 - i) * 5 * 60_000).toISOString(), context: null })).reverse();
@@ -162,6 +163,7 @@ export function startMock(port = PORT) {
       res.writeHead(302, { Location: to.toString() });
       return res.end();
     }
+    if (p === '/mock/player') return send(res, 200, { is_playing: player.is_playing, volume: player.device.volume_percent, volumeLog });
     if (p === '/mock/next-login') {
       nextLogin = url.searchParams.get('user');
       return send(res, 200, { ok: true });
@@ -240,6 +242,12 @@ export function startMock(port = PORT) {
     if (path === '/me/player/pause') { player.is_playing = false; return send(res, 204); }
     if (path === '/me/player/next') { player.item = byUri.get(player.queue?.shift()) ?? player.item; return send(res, 204); }
     if (path === '/me/player/shuffle') return send(res, 204);
+    if (path === '/me/player/volume') {
+      player.device.volume_percent = Number(url.searchParams.get('volume_percent'));
+      volumeLog.push(player.device.volume_percent);
+      return send(res, 204);
+    }
+
     if (path === '/search') {
       const q = url.searchParams.get('q').toLowerCase().replace(/track:|artist:|"/g, ' ');
       const words = q.split(/\s+/).filter(Boolean);

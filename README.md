@@ -3,6 +3,8 @@
 Proper shuffles and AI-briefed playlists for Spotify. Self-hosted, built for a couple of people.
 
 - **Deal**: pick a playlist and dj rewrites its order so the same artist never plays twice in a row and big artists are spread as far apart as the length allows. Then play it *in order*, with shuffle off. Want a new order? Deal again.
+- **Fresh deals & auto-deal**: deals push songs you've hammered lately towards the end, and any playlist can re-deal itself every morning or every Monday.
+- **Rediscover, Together, Wrapped**: playlists from your own past, one balanced playlist for the two of you, and a Wrapped for any month or year.
 - **Plays**: dj logs every play for both of you, every 10 minutes, so you get a complete history rather than Spotify's last 50. Older years can be imported from Spotify's data export.
 - **Kids**: a locked-down screen of big picture buttons for the car or the living room, with AI-made clean playlists and the kids' plays kept out of your own stats.
 - **Brief**: describe the moment ("running at 5:00/km, good rock", "deep focus, classical") and a curator (Claude) reads your Spotify listening history and builds a playlist for it.
@@ -48,6 +50,31 @@ The Brief curator now reads this log too, with play counts over the last 90 days
 **Keeping your taste yours:** plays from Kids mode playlists are tagged by playlist and kept out of your Plays stats and AI picks. Spotify's own recommendations are separate. In the Spotify app, use *⋯ → Exclude from your Taste Profile* on the kids playlists for that.
 
 Starting music needs **Spotify Premium** on the account, and the playback permission. If you logged in before Kids mode existed, the Kids tab asks you to log in again once to grant it.
+
+
+## Fresh deals and auto-deal
+
+Once dj has some play history, **Fresh deal** (on by default, on the Deal screen) uses it. Songs you've played a lot in the last few weeks drift towards the end of the order, and ones you haven't heard in a while come up early. Spacing always wins: an artist's songs stay evenly spread, so freshness only moves songs where that doesn't put an artist closer together. Songs on heavy rotation are tagged *on repeat* in the list, and after a deal dj tells you how much of the opening quarter is songs you haven't played lately.
+
+**Auto-deal** (same screen): *Every morning* or *Mondays* re-deals the playlist at 05:00 in your time zone (`AUTODEAL_HOUR` to change). It saves the previous order first, so *Undo last write* still works. Playlists on auto-deal show a ↻ in the list. A playlist that's deleted or no longer yours drops off the schedule.
+
+## Rediscover, Together, Wrapped (Plays tab)
+
+All three come from the play log. They're much richer once you've imported your Spotify history.
+
+- **Rediscover**: *Forgotten favourites* (songs you played 5+ times, then not for six months), *This week, years ago* (what you played around today's date in earlier years) and *Your YYYY* for each full year. One tap makes a dealt playlist, and tapping again refreshes the same playlist rather than making a new one.
+- **Together**: one playlist for both of you. Songs you both play come first, then each person's favourites alternately, weighted towards recent listening. The bar shows the balance. It's saved to whoever taps the button; share it from Spotify.
+- **Wrapped**: pick any month or year. You get minutes, your artist and song, top fives, artists new to you, your listening hour and biggest day, the change on the period before, and a one-line listening personality. The cards are sized for screenshots.
+
+Kids mode plays are left out of all three.
+
+## Exact-length playlists
+
+On **Brief** (and Kids → *Make a new one*), switch Length from *Songs* to *Time* and set anything from 15 minutes to 4 hours. The curator suggests songs with spares, and dj trims, tops up or swaps songs **in the middle** (never the opening or closing tracks) until the running time is within about 45 seconds of the target. The result shows the actual time next to what you asked for.
+
+## Bedtime fade (Kids mode)
+
+On a Kids button (Kids tab), set the 🌙 sleep timer to 20, 30, 45 or 60 minutes. When that button is tapped, the music plays as normal, then the volume eases down over the last 10 minutes and pauses, and the volume goes back to where it was for next time. The kids screen shows the time left. It runs on the server, so it keeps working with the phone screen locked. A few devices don't let apps change volume; on those it just pauses at the end. Restarting the container cancels a running timer.
 
 ## What Spotify allows (2026 rules)
 
@@ -139,7 +166,12 @@ server/
   spotify.js   Web API client (token refresh, 429 back-off, pagination)
   shuffle.js   the deal algorithm + spread stats (also served to the browser for the landing demo)
   curator.js   taste profile → Claude (structured output) → Spotify search matching; kids variant
-  plays.js     play log: polling, export import, stats
+  plays.js     play log: polling, export import, stats, staleness
+  deal.js      deal + write back (shared by the Deal button and auto-deal)
+  autodeal.js  overnight re-deals
+  insights.js  Rediscover, Together blend, Wrapped
+  sleep.js     Kids bedtime fade
+  passkeys.js  WebAuthn sign-in
   store.js     JSON file store in DATA_DIR
 public/        no-build frontend: index.html, styles.css, app.js
 ```

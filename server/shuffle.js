@@ -148,9 +148,43 @@ function repair(arr, rng, { maxMove = Infinity, passes = 12, tries = 24 } = {}) 
   return arr;
 }
 
-function score(order) {
+function score(order, staleness) {
   const st = spreadStats(order);
-  return st.backToBack * 1e6 + st.nearRepeats * 1e3 - st.spread;
+  let s = st.backToBack * 1e6 + st.nearRepeats * 1e3 - st.spread;
+  if (staleness) s += freshnessCost(order, staleness);
+  return s;
+}
+
+// How much "tired" music sits near the start (0 = all of it at the end).
+function freshnessCost(order, staleness) {
+  const n = order.length;
+  let c = 0;
+  order.forEach((t, i) => (c += staleness(t) * (1 - i / n)));
+  return (c / n) * 100;
+}
+
+/**
+ * Push tired tracks (high staleness, 0–1) towards the end without breaking
+ * artist spacing: random pairs are swapped only when that moves the more-played
+ * track later and doesn't make spacing any worse. Swaps are probabilistic, so a
+ * fresh deal is still different every time.
+ */
+function freshen(arr, rng) {
+  const n = arr.length;
+  const iters = Math.min(400_000, n * 40);
+  for (let t = 0; t < iters; t++) {
+    let i = Math.floor(rng() * n);
+    let j = Math.floor(rng() * n);
+    if (i === j) continue;
+    if (i > j) [i, j] = [j, i];
+    const diff = arr[i].s - arr[j].s;
+    if (diff <= 0 || diff < rng() * 0.6) continue;
+    const before = localCost(arr, i) + localCost(arr, j);
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+    const after = localCost(arr, i) + localCost(arr, j);
+    if (after > before + 1e-9) [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
 }
 
 /**
@@ -158,15 +192,24 @@ function score(order) {
  * Deals several candidates and keeps the best spread, so pressing "deal again"
  * never gives a noticeably worse result than last time.
  */
-export function properShuffle(tracks, { rng = Math.random, candidates } = {}) {
+export function properShuffle(tracks, { rng = Math.random, candidates, staleness } = {}) {
   if (tracks.length < 2) return tracks.slice();
   const k = candidates ?? (tracks.length <= 500 ? 8 : tracks.length <= 3000 ? 3 : 1);
   const primary = (t) => artistKeys(t)[0];
+  // Within an artist, their fresher songs take the earlier slots.
+  const inner = staleness
+    ? (group) => spread(group, albumKey, rng).map((t) => ({ t, k: staleness(t) + rng() * 0.25 })).sort((a, b) => a.k - b.k).map((x) => x.t)
+    : (group) => spread(group, albumKey, rng);
   let best = null;
   for (let c = 0; c < k; c++) {
-    const order = spread(tracks, primary, rng, (group) => spread(group, albumKey, rng));
-    const out = repair(prepare(order), rng).map((x) => x.t);
-    const s = k > 1 ? score(out) : 0;
+    const order = spread(tracks, primary, rng, inner);
+    let arr = repair(prepare(order), rng);
+    if (staleness) {
+      for (const x of arr) x.s = staleness(x.t);
+      arr = freshen(arr, rng);
+    }
+    const out = arr.map((x) => x.t);
+    const s = k > 1 ? score(out, staleness) : 0;
     if (!best || s < best.s) best = { s, out };
   }
   return best.out;

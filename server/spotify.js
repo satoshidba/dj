@@ -190,6 +190,7 @@ export function spotifyFor(userId) {
     resume: () => call('PUT', '/me/player/play'),
     pause: () => call('PUT', '/me/player/pause'),
     next: () => call('POST', '/me/player/next'),
+    setVolume: (percent, deviceId) => call('PUT', '/me/player/volume', { query: { volume_percent: Math.round(percent), device_id: deviceId } }),
     setShuffle: (on, deviceId) => call('PUT', '/me/player/shuffle', { query: { state: String(on), device_id: deviceId } }),
 
     search: (q, limit = 10) =>

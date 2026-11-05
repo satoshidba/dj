@@ -142,7 +142,7 @@ const SCHEMA = {
   },
 };
 
-async function askClaude({ brief, length, familiarity, taste, kids }) {
+async function askClaude({ brief, length, familiarity, taste, kids, minutes }) {
   const familiarPct = Math.round(familiarity * 100);
   const kidsBlock = kids
     ? `For: ${kids.profiles.map((k) => `${k.name || 'a child'}, age ${k.age || 'unknown'}${k.likes ? `; loves ${k.likes}` : ''}${k.avoid ? `; avoid ${k.avoid}` : ''}`).join(' | ') || 'children (ages not given)'}
@@ -152,7 +152,7 @@ Grown-up tolerance: ${Math.round(kids.tolerance * 100)}% (0 = purely for the kid
     : '';
   const user = `${kidsBlock}Brief: ${brief}
 
-Length: ${length} tracks in "tracks", plus ${Math.max(6, Math.ceil(length * 0.4))} alternates.
+${minutes ? `Running time: it must last about ${minutes} minutes in total. Give roughly ${length} tracks in "tracks" (typical song lengths), plus ${Math.max(10, Math.ceil(length * 0.5))} alternates of varied lengths; the app trims or tops up the middle to hit the time, so keep the opening and closing tracks the ones you most want there.` : `Length: ${length} tracks in "tracks", plus ${Math.max(6, Math.ceil(length * 0.4))} alternates.`}
 Familiarity: about ${familiarPct}% familiar, ${100 - familiarPct}% discovery.
 
 ${kids ? 'What the kids have been playing' : 'Their listening history'}:
@@ -249,7 +249,8 @@ async function mapLimit(items, limit, fn) {
  * Build a playlist. `progress(event)` receives stage updates for the UI.
  * Returns { title, description, tempoTarget, tracks: [...], missing: [...] }.
  */
-export async function curate({ userId, sp, brief, length, familiarity, kids = null }, progress = () => {}) {
+export async function curate({ userId, sp, brief, length, familiarity, kids = null, minutes = null }, progress = () => {}) {
+  if (minutes) length = Math.min(80, Math.max(6, Math.round(minutes / 3.6)));
   progress({ stage: 'taste' });
   let taste = null;
   if (kids) {
@@ -262,7 +263,7 @@ export async function curate({ userId, sp, brief, length, familiarity, kids = nu
   }
 
   progress({ stage: 'curating' });
-  const plan = await askClaude({ brief, length, familiarity, taste, kids });
+  const plan = await askClaude({ brief, length, familiarity, taste, kids, minutes });
   const clean = !!kids;
 
   const picks = plan.tracks.slice(0, length);
@@ -306,11 +307,64 @@ export async function curate({ userId, sp, brief, length, familiarity, kids = nu
     if (got) tracks.push(got);
   }
 
+  let fitted = tracks;
+  if (minutes) {
+    const spare = altQueue.map((a) => accept(a.track, a.want)).filter(Boolean);
+    fitted = fitToDuration(tracks, spare, minutes * 60_000);
+  }
+
   return {
     title: plan.title,
     description: plan.description,
     tempoTarget: plan.tempo_target || '',
-    tracks: separateNeighbours(tracks, { maxMove: 3 }),
+    tracks: separateNeighbours(fitted, { maxMove: 3 }),
     missing,
+    targetMinutes: minutes || null,
   };
+}
+
+/**
+ * Make an ordered tracklist last `targetMs` (± about 45 s) by removing,
+ * adding or swapping songs in the middle, so the opening and the ending the
+ * curator chose stay put.
+ */
+export function fitToDuration(tracks, pool, targetMs, tol = 45_000) {
+  const list = tracks.slice();
+  const spare = pool.slice();
+  const total = () => list.reduce((s, t) => s + (t.durationMs || 0), 0);
+  const middle = () => {
+    const n = list.length;
+    const a = Math.min(n - 1, Math.floor(n * 0.2));
+    const b = Math.max(a + 1, Math.ceil(n * 0.8));
+    return Array.from({ length: b - a }, (_, i) => a + i);
+  };
+  const closest = (items, want, dur) => items.reduce((best, x) => (!best || Math.abs(want - dur(x)) < Math.abs(want - dur(best)) ? x : best), null);
+
+  while (total() > targetMs + tol && list.length > 2) {
+    const over = total() - targetMs;
+    const i = closest(middle(), over, (k) => list[k].durationMs);
+    spare.push(list.splice(i, 1)[0]);
+  }
+  while (total() < targetMs - tol && spare.length) {
+    const under = targetMs - total();
+    const t = closest(spare, under, (x) => x.durationMs);
+    spare.splice(spare.indexOf(t), 1);
+    list.splice(Math.floor(list.length * 0.7), 0, t);
+  }
+  // Fine-tune with single swaps between the middle and the spares.
+  for (let pass = 0; pass < 4; pass++) {
+    const gap = targetMs - total();
+    if (Math.abs(gap) <= 15_000) break;
+    let best = null;
+    for (const i of middle()) {
+      for (const t of spare) {
+        const err = Math.abs(gap - (t.durationMs - list[i].durationMs));
+        if (err < Math.abs(gap) && (!best || err < best.err)) best = { i, t, err };
+      }
+    }
+    if (!best) break;
+    spare.splice(spare.indexOf(best.t), 1, list[best.i]);
+    list[best.i] = best.t;
+  }
+  return list;
 }
