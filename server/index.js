@@ -6,6 +6,7 @@ import { store } from './store.js';
 import { authorizeUrl, exchangeCode, spotifyFor, SpotifyError, SPOTIFY_API, PLAYBACK_SCOPES } from './spotify.js';
 import { properShuffle, fisherYates, spreadStats } from './shuffle.js';
 import { curate, tasteProfile, aiEnabled, kidsContexts } from './curator.js';
+import * as passkeys from './passkeys.js';
 import { startTracking, pollUser, playsFor, addPlays, fromExport, summarise, overlap, POLL_MINUTES } from './plays.js';
 
 for (const key of ['SPOTIFY_CLIENT_ID', 'SPOTIFY_CLIENT_SECRET', 'APP_URL']) {
@@ -88,9 +89,7 @@ app.get(
       image: me.images?.at(-1)?.url ?? null,
       tokens,
     });
-    const sid = crypto.randomBytes(32).toString('hex');
-    store.createSession(sid, me.id);
-    setCookie(res, SID, sid, 60 * 60 * 24 * 180);
+    startSession(res, me.id);
     pollUser(me.id); // start the play log straight away
     res.redirect('/');
   }),
@@ -102,6 +101,61 @@ app.post('/logout', (req, res) => {
   res.json({ ok: true });
 });
 
+// ------------------------------------------------------------- passkeys ----
+
+const PKC = 'dj_pkc';
+
+function startSession(res, userId) {
+  const sid = crypto.randomBytes(32).toString('hex');
+  store.createSession(sid, userId);
+  setCookie(res, SID, sid, 60 * 60 * 24 * 180);
+}
+
+const passkeyRoute = (fn) => async (req, res, next) => {
+  if (!passkeys.passkeysAvailable) return res.status(400).json({ error: passkeys.passkeysWhyNot });
+  if (req.get('x-dj') !== '1') return res.status(403).json({ error: 'Bad request' });
+  try {
+    await fn(req, res);
+  } catch (err) {
+    if (err instanceof passkeys.PasskeyError || err?.name === 'Error') {
+      console.error('passkey:', err.message);
+      return res.status(400).json({ error: err instanceof passkeys.PasskeyError ? err.message : 'The passkey couldn’t be verified. Try again.' });
+    }
+    next(err);
+  }
+};
+
+// Sign in (no session yet).
+app.post('/auth/passkey/options', passkeyRoute(async (req, res) => {
+  const { options, challengeId } = await passkeys.authenticationOptions();
+  setCookie(res, PKC, challengeId, 300);
+  res.json(options);
+}));
+
+app.post('/auth/passkey/verify', passkeyRoute(async (req, res) => {
+  const user = await passkeys.authenticate(cookies(req)[PKC], req.body?.response);
+  setCookie(res, PKC, '', 0);
+  startSession(res, user.id);
+  res.json({ ok: true });
+}));
+
+// Manage passkeys (signed in).
+app.get('/api/passkeys', auth, (req, res) => res.json({ passkeys: passkeys.listPasskeys(req.user) }));
+
+app.post('/api/passkeys/options', auth, passkeyRoute(async (req, res) => {
+  const { options, challengeId } = await passkeys.registrationOptions(req.user);
+  setCookie(res, PKC, challengeId, 300);
+  res.json(options);
+}));
+
+app.post('/api/passkeys', auth, passkeyRoute(async (req, res) => {
+  const list = await passkeys.registerPasskey(req.user, cookies(req)[PKC], req.body?.response, req.body?.name);
+  setCookie(res, PKC, '', 0);
+  res.json({ passkeys: list });
+}));
+
+app.delete('/api/passkeys/:id', auth, (req, res) => res.json({ passkeys: passkeys.removePasskey(req.user, req.params.id) }));
+
 // ------------------------------------------------------------------ api ----
 
 app.get('/api/session', (req, res) => {
@@ -111,6 +165,7 @@ app.get('/api/session', (req, res) => {
     user: user ? { id: user.id, name: user.name, image: user.image } : null,
     ai: aiEnabled(),
     playback: !!user && PLAYBACK_SCOPES.every((s) => scopes.includes(s)),
+    passkeys: { available: passkeys.passkeysAvailable, whyNot: passkeys.passkeysWhyNot, count: user?.passkeys?.length ?? 0 },
     others: user ? store.allUsers().filter((u) => u.id !== user.id).map((u) => ({ id: u.id, name: u.name, image: u.image })) : [],
   });
 });
@@ -514,6 +569,8 @@ app.post(
 
 // The shuffle is pure ESM with no dependencies, so the landing-page demo runs the real thing.
 app.get('/shuffle.js', (req, res) => res.type('text/javascript').sendFile(path.join(here, 'shuffle.js')));
+// The passkey browser helper is plain ES modules; serve it as-is (no build step).
+app.use('/vendor/simplewebauthn', express.static(path.join(here, '..', 'node_modules', '@simplewebauthn', 'browser', 'esm')));
 app.use(express.static(path.join(here, '..', 'public'), { extensions: ['html'] }));
 app.get('/{*splat}', (req, res) => res.sendFile(path.join(here, '..', 'public', 'index.html')));
 

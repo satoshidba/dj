@@ -775,3 +775,40 @@ label.btn { cursor: pointer; }
   mask: radial-gradient(farthest-side, transparent calc(100% - 4px), #000 calc(100% - 3px));
 }
 .hold.holding { color: var(--ink); }
+
+/* ============================================================== passkeys */
+
+.signin { display: grid; gap: 12px; justify-items: end; }
+.signin a { color: var(--ink); }
+@media (max-width: 720px) { .signin { justify-items: start; } }
+.btn svg { flex: none; }
+
+.nudge {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px;
+  margin: 16px var(--gutter) 0; padding: 14px 16px 14px 14px;
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--r); box-shadow: var(--shadow);
+  animation: fadeUp 0.5s var(--ease) both;
+}
+.nudge-icon, .pk-icon {
+  width: 40px; height: 40px; border-radius: 12px; flex: none;
+  display: grid; place-items: center;
+  background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent);
+}
+.nudge-text { flex: 1 1 280px; font-size: 14.5px; }
+.nudge-text b { font-weight: 500; }
+
+.sheet {
+  width: min(520px, calc(100vw - 32px)); max-height: calc(100dvh - 48px);
+  padding: 22px; border: 1px solid var(--line); border-radius: calc(var(--r) + 6px);
+  background: var(--card); color: var(--ink); box-shadow: var(--shadow);
+}
+.sheet[open] { animation: pop 0.3s var(--spring); }
+.sheet::backdrop { background: rgba(18, 17, 16, 0.4); backdrop-filter: blur(4px); }
+.sheet-head { display: flex; justify-content: space-between; align-items: center; }
+.sheet-head h2 { font-size: 36px; margin: 0; font-weight: 400; }
+.sheet .x { width: 36px; height: 36px; border-radius: 50%; border: 0; background: var(--paper-2); font-size: 20px; }
+.sheet > p { font-size: 14px; margin: 8px 0 16px; }
+.pk-list { display: grid; gap: 2px; }
+.pk { display: grid; grid-template-columns: 40px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.pk .name { font-weight: 500; }
+.pk .mono { font-size: 11.5px; }

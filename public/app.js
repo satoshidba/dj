@@ -226,7 +226,7 @@ function landing() {
   const view = h(
     'div',
     { class: 'landing' },
-    h('header', {}, h('a', { class: 'wordmark', href: '/' }, 'dj', h('i', {}, '.')), h('a', { class: 'linkish', href: '/login' }, 'Log in')),
+    h('header', {}, h('a', { class: 'wordmark', href: '/' }, 'dj', h('i', {}, '.')), state.session.passkeys?.available ? h('button', { class: 'linkish', onClick: passkeySignIn }, 'Sign in') : h('a', { class: 'linkish', href: '/login' }, 'Log in')),
     h(
       'section',
       { class: 'hero' },
@@ -236,7 +236,14 @@ function landing() {
         'div',
         { class: 'hero-row' },
         h('p', {}, 'Pick a playlist. dj ', h('b', {}, 'deals'), ' it into an order where the same artist never plays twice in a row and big artists are spread as far apart as the playlist allows. Then you just press play, in order.'),
-        h('a', { class: 'btn accent big', href: '/login' }, 'Connect Spotify', h('span', { 'aria-hidden': 'true' }, '→')),
+        state.session.passkeys?.available
+          ? h(
+              'div',
+              { class: 'signin' },
+              h('button', { class: 'btn accent big', onClick: passkeySignIn }, keyIcon(), 'Sign in with passkey'),
+              h('span', { class: 'muted small' }, 'First time here? ', h('a', { href: '/login' }, 'Connect Spotify'), '.'),
+            )
+          : h('a', { class: 'btn accent big', href: '/login' }, 'Connect Spotify', h('span', { 'aria-hidden': 'true' }, '→')),
       ),
       h(
         'div',
@@ -321,8 +328,9 @@ function appShell() {
         h(
           'div',
           { class: 'menu', role: 'menu' },
-          h('div', { class: 'hint' }, `Signed in as ${u.name}. To switch to the other account, log out and Spotify will ask who you are.`),
-          h('button', { role: 'menuitem', onClick: () => logout(true) }, 'Switch account'),
+          h('div', { class: 'hint' }, state.session.passkeys?.available ? `Signed in as ${u.name}. To switch, sign out and use the other person’s passkey.` : `Signed in as ${u.name}. To switch to the other account, log out and Spotify will ask who you are.`),
+          state.session.passkeys?.available ? h('button', { role: 'menuitem', onClick: () => { toggle(); openPasskeys(); } }, 'Passkeys') : null,
+          h('button', { role: 'menuitem', onClick: () => logout(!state.session.passkeys?.available) }, 'Switch account'),
           h('button', { role: 'menuitem', onClick: () => logout(false) }, 'Log out'),
         ),
       );
@@ -342,6 +350,7 @@ function appShell() {
     'div',
     {},
     h('header', { class: 'top' }, h('a', { class: 'wordmark', href: '#/deal' }, 'dj', h('i', {}, '.')), h('nav', { class: 'tabs', role: 'tablist' }, tab('deal', 'Deal'), tab('brief', 'Brief'), tab('plays', 'Plays'), tab('kids', 'Kids')), menuHost),
+    passkeyNudge(),
     { brief: briefView, plays: playsView, kids: kidsView }[state.tab]?.() ?? dealView(),
   );
 }
@@ -1620,6 +1629,129 @@ function holdToExit() {
   for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) btn.addEventListener(ev, stop);
   btn.addEventListener('contextmenu', (e) => e.preventDefault());
   return btn;
+}
+
+
+// --------------------------------------------------------------- passkeys --
+// Spotify links your account once; after that, devices sign in to dj with a
+// passkey (Face ID, Touch ID, fingerprint).
+
+const webauthn = () => import('/vendor/simplewebauthn/index.js');
+const NUDGE_KEY = 'dj_passkey_nudge_dismissed';
+
+function keyIcon() {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('width', '20');
+  svg.setAttribute('height', '20');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.innerHTML = '<circle cx="8" cy="8" r="4.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M11.2 11.2 20 20m-3.5-3.5 2-2m-4.5-.5 2-2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>';
+  return svg;
+}
+
+function deviceName() {
+  const ua = navigator.userAgent;
+  const device = /iPad/.test(ua) ? 'iPad' : /iPhone/.test(ua) ? 'iPhone' : /Android/.test(ua) ? 'Android' : /Mac/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows PC' : /Linux/.test(ua) ? 'Linux' : 'This device';
+  const browser = /Edg\//.test(ua) ? 'Edge' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : '';
+  return browser ? `${device} · ${browser}` : device;
+}
+
+const cancelled = (err) => err?.name === 'NotAllowedError' || err?.name === 'AbortError';
+
+async function passkeySignIn() {
+  try {
+    const { startAuthentication, browserSupportsWebAuthn } = await webauthn();
+    if (!browserSupportsWebAuthn()) return toast('This browser doesn’t support passkeys. Use Connect Spotify instead.', { error: true });
+    const optionsJSON = await api('/auth/passkey/options', { method: 'POST', body: {} });
+    const response = await startAuthentication({ optionsJSON });
+    await api('/auth/passkey/verify', { method: 'POST', body: { response } });
+    state.session = await fetch('/api/session').then((r) => r.json());
+    route();
+  } catch (err) {
+    if (cancelled(err)) return;
+    toast(err.message || 'Sign-in failed.', { error: true, ms: 8000 });
+  }
+}
+
+async function addPasskey() {
+  try {
+    const { startRegistration, browserSupportsWebAuthn } = await webauthn();
+    if (!browserSupportsWebAuthn()) throw new Error('This browser doesn’t support passkeys.');
+    const optionsJSON = await api('/api/passkeys/options', { method: 'POST', body: {} });
+    const response = await startRegistration({ optionsJSON });
+    const r = await api('/api/passkeys', { method: 'POST', body: { response, name: deviceName() } });
+    state.session.passkeys.count = r.passkeys.length;
+    toast('Passkey saved. Next time, sign in with it.');
+    return r.passkeys;
+  } catch (err) {
+    if (err?.name === 'InvalidStateError') toast('This device already has a dj passkey for you.');
+    else if (!cancelled(err)) toast(err.message || 'Couldn’t create a passkey.', { error: true, ms: 8000 });
+    return null;
+  }
+}
+
+function passkeyNudge() {
+  const pk = state.session.passkeys;
+  let dismissed = false;
+  try {
+    dismissed = localStorage.getItem(NUDGE_KEY) === '1';
+  } catch {
+    /* ignore */
+  }
+  if (!pk?.available || pk.count > 0 || dismissed) return null;
+  const el = h(
+    'div',
+    { class: 'nudge' },
+    h('span', { class: 'nudge-icon' }, keyIcon()),
+    h('div', { class: 'nudge-text' }, h('b', {}, 'Skip Spotify next time. '), 'Add a passkey and sign in to dj with Face ID or your fingerprint, on this device and any other.'),
+    h('button', { class: 'btn accent small', onClick: async () => { if (await addPasskey()) el.remove(); } }, 'Add a passkey'),
+    h('button', { class: 'linkish', onClick: () => { try { localStorage.setItem(NUDGE_KEY, '1'); } catch { /* ignore */ } el.remove(); } }, 'Not now'),
+  );
+  return el;
+}
+
+async function openPasskeys() {
+  const list = h('div', { class: 'pk-list' }, h('div', { class: 'skeleton', style: { height: '56px' } }));
+  const dlg = h(
+    'dialog',
+    { class: 'sheet', 'aria-label': 'Passkeys' },
+    h('div', { class: 'sheet-head' }, h('h2', { class: 'serif' }, 'Passkeys'), h('button', { class: 'x', 'aria-label': 'Close', onClick: () => dlg.close() }, '×')),
+    h('p', { class: 'muted' }, 'Each passkey signs you in to dj on the devices it syncs to (iCloud Keychain, Google Password Manager and so on). Removing one here stops it working.'),
+    list,
+    h('div', { class: 'actions' }, h('button', { class: 'btn accent', onClick: async () => { const r = await addPasskey(); if (r) fill(r); } }, keyIcon(), 'Add a passkey on this device')),
+  );
+  dlg.addEventListener('close', () => dlg.remove());
+  dlg.addEventListener('click', (e) => e.target === dlg && dlg.close());
+  document.body.append(dlg);
+  dlg.showModal();
+
+  function fill(passkeys) {
+    state.session.passkeys.count = passkeys.length;
+    list.replaceChildren(
+      ...(passkeys.length
+        ? passkeys.map((p) =>
+            h(
+              'div',
+              { class: 'pk' },
+              h('span', { class: 'pk-icon' }, keyIcon()),
+              h('div', { style: { minWidth: 0 } }, h('div', { class: 'name' }, p.name), h('div', { class: 'mono muted' }, `Added ${new Date(p.createdAt).toLocaleDateString()}`, p.lastUsedAt ? ` · last used ${ago(p.lastUsedAt)}` : ' · not used yet', p.backedUp ? ' · synced' : '')),
+              h('button', {
+                class: 'linkish',
+                onClick: async () => {
+                  if (!confirm(`Remove “${p.name}”? It will stop signing you in.`)) return;
+                  fill((await api(`/api/passkeys/${encodeURIComponent(p.id)}`, { method: 'DELETE' })).passkeys);
+                },
+              }, 'Remove'),
+            ),
+          )
+        : [h('p', { class: 'muted' }, 'No passkeys yet.')]),
+    );
+  }
+  try {
+    fill((await api('/api/passkeys')).passkeys);
+  } catch (err) {
+    toast(err.message, { error: true });
+  }
 }
 
 // ------------------------------------------------------------------- boot --

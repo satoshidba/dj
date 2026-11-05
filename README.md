@@ -99,9 +99,17 @@ Because Spotify requires HTTPS for anything other than `127.0.0.1`, put dj behin
 - **Tailscale**: `tailscale serve --bg 8080` gives you `https://<machine>.<tailnet>.ts.net`, private to your tailnet. This is the easiest option for two people.
 - **Cloudflare Tunnel**, **Caddy**, or **Traefik** with a real domain.
 
-### Two users
+### Two users, and passkeys
 
-Each person opens dj and taps **Connect Spotify**. Sessions are per browser, so on your own phones you'll each just stay logged in. On a shared computer, use the avatar menu → **Switch account**; Spotify will ask which account to use.
+**The first time**, each person taps **Connect Spotify** and signs in with their own Spotify account. This links the account and is the only time you see Spotify's login.
+
+Straight after, dj offers to **add a passkey**. From then on, any device signs in with **Sign in with passkey** using Face ID, Touch ID or a fingerprint. No username, no Spotify page. Passkeys sync through iCloud Keychain or Google Password Manager, so your other devices work too. Each person's passkey signs into their own account.
+
+Manage passkeys from the avatar menu → **Passkeys**: see where each one was added and last used, add one on the current device, or remove one so it stops working. To switch person on a shared device, use **Switch account** and sign in with the other passkey.
+
+Passkeys need `APP_URL` to be **HTTPS with a hostname**, such as your Tailscale `https://<machine>.<tailnet>.ts.net`. They don't work on `http://127.0.0.1` or a bare IP, so the app just shows Connect Spotify there. A passkey is tied to that exact hostname: if you rename the machine or tailnet, add new passkeys. Set `PASSKEY_RP_ID` only if you serve dj on a subdomain and want passkeys to work across the parent domain.
+
+dj stores only each passkey's public key. Nothing secret is kept for them.
 
 To lock the app to only your two accounts, set `ALLOWED_SPOTIFY_IDS=id1,id2` (the "Username" on your Spotify account page).
 
