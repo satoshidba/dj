@@ -1,11 +1,10 @@
 // The AI side: turn a brief ("5:00/km run, rock") plus someone's listening
 // history into a real, playable Spotify tracklist.
 //
-// Flow: taste profile (top artists/tracks + recent plays) → Claude writes a
+// Flow: taste profile (top artists/tracks + recent plays) → the curator writes a
 // tracklist with structured output → each suggestion is matched against
-// Spotify search → misses are filled from Claude's alternates → the order is
+// Spotify search → misses are filled from the curator's alternates → the order is
 // nudged so no artist plays back to back.
-import Anthropic from '@anthropic-ai/sdk';
 import { separateNeighbours } from './shuffle.js';
 import { simplifyTrack } from './spotify.js';
 import { playsFor, summarise } from './plays.js';
@@ -13,10 +12,8 @@ import { store } from './store.js';
 
 export const kidsContexts = (userId) => new Set(store.kidsPlaylists(userId).map((p) => `spotify:playlist:${p.id}`));
 
-const MODEL = process.env.ANTHROPIC_MODEL || 'claude-opus-5-5';
-let client = null;
-export const aiEnabled = () => !!(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN);
-const anthropic = () => (client ??= new Anthropic());
+const MODEL = 'openrouter/free';
+export const aiEnabled = () => !!process.env.OPENROUTER_API_KEY;
 
 // ---------------------------------------------------------------- taste ----
 
@@ -90,7 +87,7 @@ function describeTaste(p) {
     .join('\n\n');
 }
 
-// --------------------------------------------------------------- claude ----
+// -------------------------------------------------------------- curator ----
 
 const SYSTEM = `You are a music curator building a playlist for one specific person. You get their brief and a summary of their Spotify listening history.
 
@@ -142,7 +139,7 @@ const SCHEMA = {
   },
 };
 
-async function askClaude({ brief, length, familiarity, taste, kids, minutes }) {
+async function askCurator({ brief, length, familiarity, taste, kids, minutes }) {
   const familiarPct = Math.round(familiarity * 100);
   const kidsBlock = kids
     ? `For: ${kids.profiles.map((k) => `${k.name || 'a child'}, age ${k.age || 'unknown'}${k.likes ? `; loves ${k.likes}` : ''}${k.avoid ? `; avoid ${k.avoid}` : ''}`).join(' | ') || 'children (ages not given)'}
@@ -158,23 +155,24 @@ Familiarity: about ${familiarPct}% familiar, ${100 - familiarPct}% discovery.
 ${kids ? 'What the kids have been playing' : 'Their listening history'}:
 ${kids ? kids.history : describeTaste(taste)}`;
 
-  const stream = anthropic().beta.messages.stream({
-    model: MODEL,
-    max_tokens: 32000,
-    betas: ['server-side-fallback-2026-07-01'],
-    fallbacks: 'default',
-    thinking: { type: 'adaptive' },
-    output_config: { effort: 'medium', format: { type: 'json_schema', schema: SCHEMA } },
-    system: kids ? KIDS_SYSTEM : SYSTEM,
-    messages: [{ role: 'user', content: user }],
+  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: MODEL,
+      messages: [{ role: 'system', content: kids ? KIDS_SYSTEM : SYSTEM }, { role: 'user', content: user }],
+      response_format: { type: 'json_schema', json_schema: { name: 'playlist', strict: true, schema: SCHEMA } },
+    }),
+    signal: AbortSignal.timeout(180_000),
   });
-  const msg = await stream.finalMessage();
-
-  if (msg.stop_reason === 'refusal') throw new Error("The curator declined that brief. Try wording it differently.");
-  if (msg.stop_reason === 'max_tokens') throw new Error('The curator ran out of room. Try a shorter playlist.');
-  const text = msg.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
+  if (!response.ok) throw new Error(`The curator is unavailable (OpenRouter ${response.status}). Try again later.`);
+  const result = await response.json();
+  const choice = result.choices?.[0];
+  if (choice?.finish_reason === 'length') throw new Error('The curator ran out of room. Try a shorter playlist.');
   try {
-    return JSON.parse(text);
+    const plan = JSON.parse(choice?.message?.content);
+    if (typeof plan.title !== 'string' || typeof plan.description !== 'string' || !Array.isArray(plan.tracks) || !Array.isArray(plan.alternates) || ![...plan.tracks, ...plan.alternates].every((t) => t && typeof t.artist === 'string' && typeof t.title === 'string')) throw new Error('Invalid playlist');
+    return plan;
   } catch {
     throw new Error('The curator returned something unreadable. Try again.');
   }
@@ -263,7 +261,7 @@ export async function curate({ userId, sp, brief, length, familiarity, kids = nu
   }
 
   progress({ stage: 'curating' });
-  const plan = await askClaude({ brief, length, familiarity, taste, kids, minutes });
+  const plan = await askCurator({ brief, length, familiarity, taste, kids, minutes });
   const clean = !!kids;
 
   const picks = plan.tracks.slice(0, length);

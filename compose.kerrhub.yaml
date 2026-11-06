@@ -1,0 +1,17 @@
+# VM 1051: central Traefik forwards dj.kerrhub.com to this LAN-only port.
+# /srv/dj/app.env is a root-only runtime file populated from Vaultwarden.
+name: dj
+services:
+  dj:
+    build: .
+    image: dj:kerrhub
+    restart: unless-stopped
+    env_file: /srv/dj/app.env
+    environment:
+      TZ: Europe/London
+    ports:
+      - "192.168.10.51:8191:8080"
+    volumes:
+      - dj-data:/data
+volumes:
+  dj-data:

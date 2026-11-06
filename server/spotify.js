@@ -33,11 +33,10 @@ export const PLAYBACK_SCOPES = ['user-read-playback-state', 'user-modify-playbac
 
 const cfg = () => ({
   clientId: process.env.SPOTIFY_CLIENT_ID,
-  clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
   redirectUri: `${process.env.APP_URL.replace(/\/$/, '')}/callback`,
 });
 
-export function authorizeUrl(state) {
+export function authorizeUrl(state, challenge) {
   const { clientId, redirectUri } = cfg();
   const q = new URLSearchParams({
     response_type: 'code',
@@ -45,20 +44,21 @@ export function authorizeUrl(state) {
     scope: SCOPES,
     redirect_uri: redirectUri,
     state,
+    code_challenge_method: 'S256',
+    code_challenge: challenge,
     show_dialog: 'true', // lets the second person pick their own account on a shared device
   });
   return `${ACCOUNTS}/authorize?${q}`;
 }
 
 async function tokenRequest(params) {
-  const { clientId, clientSecret } = cfg();
+  const { clientId } = cfg();
   const res = await fetch(`${ACCOUNTS}/api/token`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
-      Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`,
     },
-    body: new URLSearchParams(params),
+    body: new URLSearchParams({ ...params, client_id: clientId }),
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new SpotifyError(res.status, body.error_description || body.error || 'token request failed');
@@ -70,8 +70,8 @@ async function tokenRequest(params) {
   };
 }
 
-export const exchangeCode = (code) =>
-  tokenRequest({ grant_type: 'authorization_code', code, redirect_uri: cfg().redirectUri });
+export const exchangeCode = (code, verifier) =>
+  tokenRequest({ grant_type: 'authorization_code', code, code_verifier: verifier, redirect_uri: cfg().redirectUri });
 
 export class SpotifyError extends Error {
   constructor(status, message) {

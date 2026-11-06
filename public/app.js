@@ -810,7 +810,7 @@ function briefView() {
         form,
         h('div', { class: 'chips' }, EXAMPLES.map((ex, i) => h('button', { class: 'chip', style: { animationDelay: `${i * 40}ms` }, disabled: b.running, onClick: () => { b.text = ex; ta.value = ex; ta.focus(); } }, ex))),
         !state.session.ai
-          ? h('div', { class: 'setup' }, h('b', {}, 'Briefs need an Anthropic API key. '), 'Set ', h('code', {}, 'ANTHROPIC_API_KEY'), ' in your ', h('code', {}, '.env'), ' and restart the container. Dealing works without it.')
+          ? h('div', { class: 'setup' }, h('b', {}, 'Briefs need an OpenRouter API key. '), 'Set ', h('code', {}, 'OPENROUTER_API_KEY'), ' in your ', h('code', {}, '.env'), ' and restart the container. Dealing works without it.')
           : null,
         b.steps.length ? progressView(b.steps) : null,
         b.result ? resultView(b) : null,
@@ -1725,7 +1725,7 @@ function kidsMaker(b, profiles) {
       ),
     ),
     !profiles.length ? h('p', { class: 'muted small' }, 'Tip: add the kids above first, with ages, so the picks fit them.') : null,
-    !state.session.ai ? h('div', { class: 'setup' }, 'Making playlists needs ', h('code', {}, 'ANTHROPIC_API_KEY'), '. You can still add playlists you already have.') : null,
+    !state.session.ai ? h('div', { class: 'setup' }, 'Making playlists needs ', h('code', {}, 'OPENROUTER_API_KEY'), '. You can still add playlists you already have.') : null,
     b.steps.length ? progressView(b.steps) : null,
     b.result ? kidsResult(b) : null,
   );

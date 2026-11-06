@@ -14,7 +14,6 @@
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^1.5.0",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "@simplewebauthn/browser": "^14.0.0",
     "@simplewebauthn/server": "^14.0.3",

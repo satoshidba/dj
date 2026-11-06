@@ -16,7 +16,7 @@ import { actions, runAction, inputSchema } from './actions.js';
 import { handleMcp } from './mcp.js';
 import { startTracking, pollUser, playsFor, addPlays, fromExport, summarise, overlap, POLL_MINUTES, freshStart } from './plays.js';
 
-for (const key of ['SPOTIFY_CLIENT_ID', 'SPOTIFY_CLIENT_SECRET', 'APP_URL']) {
+for (const key of ['SPOTIFY_CLIENT_ID', 'APP_URL']) {
   if (!process.env[key]) {
     console.error(`Missing ${key}. See README.md → Setup.`);
     process.exit(1);
@@ -39,6 +39,7 @@ app.use(express.json({ limit: '2mb' }));
 
 const SID = 'dj_sid';
 const STATE = 'dj_oauth';
+const VERIFIER = 'dj_pkce';
 
 function cookies(req) {
   const out = {};
@@ -71,8 +72,11 @@ const wrap = (fn) => (req, res, next) => fn(req, res, next).catch(next);
 
 app.get('/login', (req, res) => {
   const state = crypto.randomBytes(16).toString('hex');
+  const verifier = crypto.randomBytes(32).toString('base64url');
+  const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
   setCookie(res, STATE, state, 600);
-  res.redirect(authorizeUrl(state));
+  setCookie(res, VERIFIER, verifier, 600);
+  res.redirect(authorizeUrl(state, challenge));
 });
 
 app.get(
@@ -80,10 +84,12 @@ app.get(
   wrap(async (req, res) => {
     const { code, state, error } = req.query;
     if (error) return res.redirect(`/?error=${encodeURIComponent(error)}`);
-    if (!code || !state || state !== cookies(req)[STATE]) return res.redirect('/?error=state_mismatch');
+    const verifier = cookies(req)[VERIFIER];
+    if (!code || !state || !verifier || state !== cookies(req)[STATE]) return res.redirect('/?error=state_mismatch');
     setCookie(res, STATE, '', 0);
+    setCookie(res, VERIFIER, '', 0);
 
-    const tokens = await exchangeCode(code);
+    const tokens = await exchangeCode(code, verifier);
     const me = await fetch(`${SPOTIFY_API}/me`, {
       headers: { Authorization: `Bearer ${tokens.accessToken}` },
     }).then((r) => r.json());
@@ -324,7 +330,7 @@ app.get(
 );
 
 app.post('/api/brief', auth, async (req, res) => {
-  if (!aiEnabled()) return res.status(503).json({ error: 'Set ANTHROPIC_API_KEY to use briefs.' });
+  if (!aiEnabled()) return res.status(503).json({ error: 'Set OPENROUTER_API_KEY to use briefs.' });
   const brief = String(req.body?.brief ?? '').trim().slice(0, 600);
   const length = Math.min(80, Math.max(8, Number(req.body?.length) || 25));
   const familiarity = Math.min(1, Math.max(0, Number(req.body?.familiarity ?? 0.5)));
@@ -527,7 +533,7 @@ app.delete('/api/kids/playlists/:id', auth, (req, res) => {
 });
 
 app.post('/api/kids/brief', auth, async (req, res) => {
-  if (!aiEnabled()) return res.status(503).json({ error: 'Set ANTHROPIC_API_KEY to make playlists with AI.' });
+  if (!aiEnabled()) return res.status(503).json({ error: 'Set OPENROUTER_API_KEY to make playlists with AI.' });
   const brief = String(req.body?.brief ?? '').trim().slice(0, 600);
   const length = Math.min(60, Math.max(8, Number(req.body?.length) || 20));
   const tolerance = Math.min(1, Math.max(0, Number(req.body?.tolerance ?? 0.5)));

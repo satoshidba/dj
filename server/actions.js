@@ -282,7 +282,7 @@ export const actions = [
   {
     name: 'brief_playlist',
     title: 'Make a playlist from a brief (dj’s AI)',
-    description: 'Have dj’s own curator (Claude, using the server’s Anthropic key) build and save a playlist from a plain-English brief and the user’s listening history, e.g. "running at 5:00/km, rock". Set minutes to make it last that long. Takes 20–60 seconds. If you’d rather choose the songs yourself, use create_playlist.',
+    description: 'Have dj’s own curator (using the server’s OpenRouter key) build and save a playlist from a plain-English brief and the user’s listening history, e.g. "running at 5:00/km, rock". Set minutes to make it last that long. Takes 20–60 seconds. If you’d rather choose the songs yourself, use create_playlist.',
     readOnly: false,
     input: {
       brief: z.string().min(3).max(600),
@@ -292,7 +292,7 @@ export const actions = [
       save: z.boolean().default(true),
     },
     async run(ctx, { brief, songs, minutes, familiarity, save }) {
-      if (!aiEnabled()) throw new ServiceError(503, 'dj has no Anthropic key, so its curator is off. Use create_playlist with your own song choices instead.');
+      if (!aiEnabled()) throw new ServiceError(503, 'dj has no OpenRouter key, so its curator is off. Use create_playlist with your own song choices instead.');
       const r = await curate({ userId: ctx.user.id, sp: ctx.sp, brief, length: songs, familiarity, minutes: minutes ?? null });
       const out = { title: r.title, description: r.description, tempo: r.tempoTarget || null, minutes: Math.round(r.tracks.reduce((s, t) => s + t.durationMs, 0) / 60000), songs: r.tracks.map((t) => `${songLine(t)}${t.estBpm ? ` (~${t.estBpm} bpm)` : ''}`), not_found: r.missing };
       if (!save) return out;

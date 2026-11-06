@@ -8,7 +8,7 @@ Proper shuffles and AI-briefed playlists for Spotify. Self-hosted, built for a c
 - **Agents**: Hermes, Pi, Claude or any other agent can use dj through an MCP server, a `dj` command-line tool with an Agent Skill, or a plain HTTP API.
 - **Plays**: dj logs every play for both of you, every 10 minutes, so you get a complete history rather than Spotify's last 50. Older years can be imported from Spotify's data export.
 - **Kids**: a locked-down screen of big picture buttons for the car or the living room, with AI-made clean playlists and the kids' plays kept out of your own stats.
-- **Brief**: describe the moment ("running at 5:00/km, good rock", "deep focus, classical") and a curator (Claude) reads your Spotify listening history and builds a playlist for it.
+- **Brief**: describe the moment ("running at 5:00/km, good rock", "deep focus, classical") and a curator reads your Spotify listening history and builds a playlist for it.
 
 ## How the shuffle works
 
@@ -120,7 +120,7 @@ claude mcp add --transport http dj https://<your-dj>/mcp --header "Authorization
 
 **Things to know**
 - Agents must be able to reach dj. Anything on your tailnet can. Claude on the web and phone apps connect from Anthropic's servers, so they'd need dj made public (e.g. Tailscale Funnel). That's your call; it's off by default.
-- `create_playlist` lets the agent choose the songs with its own model (no dj AI needed). `brief_playlist` uses dj's curator and your Anthropic key.
+- `create_playlist` lets the agent choose the songs with its own model (no dj AI needed). `brief_playlist` uses dj's curator and your OpenRouter key.
 - Tokens are stored as hashes, can be revoked any time, and show when they were last used. Repeated bad tokens from one address are slowed down; valid tokens are never blocked.
 
 ## What Spotify allows (2026 rules)
@@ -148,7 +148,7 @@ Development Mode also needs the **app owner to have Spotify Premium** and allows
    Spotify only accepts `https://` URLs or loopback IPs (`127.0.0.1`), **not** `localhost` and not plain-http LAN IPs like `http://192.168.1.20`.
 3. Tick **Web API**.
 4. In **User Management**, add both people's Spotify accounts (name + email). Without this, the second person gets an error at login.
-5. Copy the **Client ID** and **Client secret**.
+5. Copy the **Client ID**. dj uses interactive OAuth with PKCE, so it does not need the client secret.
 
 ### 2. Configure
 
@@ -156,7 +156,7 @@ Development Mode also needs the **app owner to have Spotify Premium** and allows
 cp .env.example .env
 ```
 
-Then fill in `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `APP_URL` and, for Briefs, `ANTHROPIC_API_KEY` (from <https://console.anthropic.com>). Dealing works without the Anthropic key.
+Then fill in `SPOTIFY_CLIENT_ID`, `APP_URL` and, for Briefs, `OPENROUTER_API_KEY` (from <https://openrouter.ai/keys>). Dealing works without the OpenRouter key.
 
 ### 3. Run with Docker
 
@@ -195,13 +195,12 @@ npm test            # shuffle tests
 npm run dev         # needs the env vars above
 ```
 
-`test/mock-services.js` is a fake Spotify + Anthropic API for driving the whole UI without real accounts:
+`test/mock-services.js` is a fake Spotify API for driving the UI without real accounts. AI briefs require a real OpenRouter key:
 
 ```bash
 node test/mock-services.js &
-SPOTIFY_CLIENT_ID=x SPOTIFY_CLIENT_SECRET=y APP_URL=http://127.0.0.1:8080 \
+SPOTIFY_CLIENT_ID=x APP_URL=http://127.0.0.1:8080 \
 SPOTIFY_API_BASE=http://127.0.0.1:9099/v1 SPOTIFY_ACCOUNTS_BASE=http://127.0.0.1:9099/accounts \
-ANTHROPIC_API_KEY=test ANTHROPIC_BASE_URL=http://127.0.0.1:9099/anthropic \
 npm run dev
 ```
 
@@ -212,7 +211,7 @@ server/
   index.js     routes, OAuth, sessions
   spotify.js   Web API client (token refresh, 429 back-off, pagination)
   shuffle.js   the deal algorithm + spread stats (also served to the browser for the landing demo)
-  curator.js   taste profile → Claude (structured output) → Spotify search matching; kids variant
+  curator.js   taste profile → OpenRouter free model (structured output) → Spotify search matching; kids variant
   plays.js     play log: polling, export import, stats, staleness
   deal.js      deal + write back (shared by the Deal button and auto-deal)
   autodeal.js  overnight re-deals
@@ -229,4 +228,4 @@ skills/dj/     Agent Skill (SKILL.md) for Pi and others
 public/        no-build frontend: index.html, styles.css, app.js
 ```
 
-Briefs use `claude-opus-5-5` by default (override with `ANTHROPIC_MODEL`), with server-side fallbacks enabled so a declined request is retried on another model. One brief costs a few cents.
+Briefs use OpenRouter’s `openrouter/free` router only. Free models can be rate-limited and may vary in quality and availability. Listening history and briefs are sent to OpenRouter and its selected model provider.
