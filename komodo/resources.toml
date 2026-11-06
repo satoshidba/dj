@@ -1,0 +1,16 @@
+# Non-secret Komodo stack configuration for VM 1051.
+[[stack]]
+name = "dj"
+description = "Spotify playlists and free-model music curator"
+tags = ["kerrhub", "dj"]
+deploy = true
+
+[stack.config]
+server = "vm-media-mgmt"
+project_name = "dj"
+git_provider = "github.com"
+repo = "satoshidba/dj"
+branch = "kerrhub-deploy"
+file_paths = ["compose.kerrhub.yaml"]
+auto_pull = false
+run_build = true
